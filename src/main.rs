@@ -640,7 +640,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         signing_key,
         my_public.as_bytes(),
         &challenge,
-        1,
+        2,
     )
     .expect("Failed to send identity");
 
