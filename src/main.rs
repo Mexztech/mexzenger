@@ -102,35 +102,30 @@ fn receive_challenge(stream: &mut TcpStream) -> io::Result<[u8; handshake::CHALL
     Ok(challenge)
 }
 
-fn send_identity(
-    stream: &mut TcpStream,
-    signing_key: &SigningKey,
-    x25519_public: &[u8; 32],
-    challenge: &[u8; handshake::CHALLENGE_SIZE],
-    role: u8,
-) -> io::Result<()> {
+fn send_identity_key(stream: &mut TcpStream, signing_key: &SigningKey) -> io::Result<()> {
     let verifying_key = signing_key.verifying_key();
-
-    let x25519_public = x25519_dalek::PublicKey::from(*x25519_public);
-
-    let signature = handshake::sign_handshake(signing_key, &x25519_public, challenge, role);
-
     stream.write_all(verifying_key.as_bytes())?;
+    stream.flush()
+}
+
+fn send_signature(stream: &mut TcpStream, signature: &Signature) -> io::Result<()> {
     stream.write_all(signature.to_bytes().as_ref())?;
     stream.flush()
 }
 
-fn receive_identity(stream: &mut TcpStream) -> io::Result<(VerifyingKey, Signature)> {
+fn receive_identity(stream: &mut TcpStream) -> io::Result<VerifyingKey> {
     let mut identity_bytes = [0u8; 32];
-    let mut signature_bytes = [0u8; 64];
-
     stream.read_exact(&mut identity_bytes)?;
+
+    VerifyingKey::from_bytes(&identity_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid identity key"))
+}
+
+fn receive_signature(stream: &mut TcpStream) -> io::Result<Signature> {
+    let mut signature_bytes = [0u8; 64];
     stream.read_exact(&mut signature_bytes)?;
 
-    let identity_key = VerifyingKey::from_bytes(&identity_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid identity key"))?;
-
-    Ok((identity_key, Signature::from_bytes(&signature_bytes)))
+    Ok(Signature::from_bytes(&signature_bytes))
 }
 
 fn fingerprint(key: &VerifyingKey) -> String {
@@ -542,45 +537,52 @@ fn start_server(signing_key: &SigningKey) {
         .expect("Could not set write timeout");
 
     let challenge = handshake::generate_challenge();
-
     send_challenge(&mut stream, &challenge).expect("Failed to send challenge");
 
     let (my_secret, my_public) = handshake::generate_keypair();
-
     send_public_key(&mut stream, my_public.as_bytes()).expect("Failed to send public key");
 
-    send_identity(
-        &mut stream,
-        signing_key,
-        my_public.as_bytes(),
-        &challenge,
-        1,
-    )
-    .expect("Failed to send identity");
+    send_identity_key(&mut stream, signing_key).expect("Failed to send server identity");
 
     let remote_public =
         receive_public_key(&mut stream).expect("Failed to receive client public key");
+    let remote_identity = receive_identity(&mut stream).expect("Failed to receive client identity");
 
-    let (remote_identity, remote_signature) =
-        receive_identity(&mut stream).expect("Failed to receive client identity");
-
+    let server_identity = signing_key.verifying_key();
     let remote_x25519 = x25519_dalek::PublicKey::from(remote_public);
 
-    if !handshake::verify_handshake(
-        &remote_identity,
-        &remote_x25519,
+    let server_signature = handshake::sign_handshake_transcript(
+        signing_key,
         &challenge,
-        &remote_signature,
-        2,
+        &server_identity,
+        &remote_identity,
+        &my_public,
+        &remote_x25519,
+    );
+
+    send_signature(&mut stream, &server_signature)
+        .expect("Failed to send server transcript signature");
+
+    let client_signature =
+        receive_signature(&mut stream).expect("Failed to receive client transcript signature");
+
+    if !handshake::verify_handshake_transcript(
+        &remote_identity,
+        &client_signature,
+        &challenge,
+        &server_identity,
+        &remote_identity,
+        &my_public,
+        &remote_x25519,
     ) {
-        panic!("Client identity verification FAILED");
+        panic!("Client transcript verification FAILED");
     }
 
     println!("Client identity verified");
 
     let shared_secret = derive_session_secret(&my_secret, &my_public, &remote_x25519);
-
     let session_id = derive_session_id(&shared_secret);
+
     println!("X25519 handshake successful");
 
     let ratchet = create_ratchet_bob(shared_secret, *my_secret.as_bytes());
@@ -612,41 +614,56 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     println!("Server X25519 public key received");
 
-    let (server_identity, server_signature) =
-        receive_identity(&mut stream).expect("Failed to receive server identity");
+    let server_identity = receive_identity(&mut stream).expect("Failed to receive server identity");
 
     let server_x25519 = x25519_dalek::PublicKey::from(server_public);
 
-    if !handshake::verify_handshake(
-        &server_identity,
-        &server_x25519,
-        &challenge,
-        &server_signature,
-        1,
-    ) {
-        panic!("Server identity verification FAILED");
-    }
-
-    println!("Server identity verified");
+    println!("Server identity received");
 
     if !verify_or_pin_identity(&server_identity) {
         return;
     }
 
-    send_public_key(&mut stream, my_public.as_bytes()).expect("Failed to send public key");
+    send_public_key(&mut stream, my_public.as_bytes()).expect("Failed to send client public key");
 
-    send_identity(
-        &mut stream,
-        signing_key,
-        my_public.as_bytes(),
+    send_identity_key(&mut stream, signing_key).expect("Failed to send client identity");
+
+    let client_identity = signing_key.verifying_key();
+
+    let server_signature =
+        receive_signature(&mut stream).expect("Failed to receive server transcript signature");
+
+    if !handshake::verify_handshake_transcript(
+        &server_identity,
+        &server_signature,
         &challenge,
-        2,
-    )
-    .expect("Failed to send identity");
+        &server_identity,
+        &client_identity,
+        &server_x25519,
+        &my_public,
+    ) {
+        panic!("Server transcript verification FAILED");
+    }
+
+    println!("Server transcript verified");
+
+    let client_signature = handshake::sign_handshake_transcript(
+        signing_key,
+        &challenge,
+        &server_identity,
+        &client_identity,
+        &server_x25519,
+        &my_public,
+    );
+
+    send_signature(&mut stream, &client_signature)
+        .expect("Failed to send client transcript signature");
+
+    println!("Client identity verified");
 
     let shared_secret = derive_session_secret(&my_secret, &my_public, &server_x25519);
-
     let session_id = derive_session_id(&shared_secret);
+
     println!("X25519 handshake successful");
 
     let ratchet = create_ratchet_alice(shared_secret, server_public);
