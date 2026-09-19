@@ -24,6 +24,28 @@ pub fn generate_keypair() -> (StaticSecret, PublicKey) {
     (secret, public)
 }
 
+use sha2::{Digest, Sha256};
+
+pub fn handshake_transcript_hash(
+    challenge: &[u8; CHALLENGE_SIZE],
+    server_identity: &VerifyingKey,
+    client_identity: &VerifyingKey,
+    server_x25519: &PublicKey,
+    client_x25519: &PublicKey,
+) -> [u8; 32] {
+    let transcript = handshake_transcript(
+        challenge,
+        server_identity,
+        client_identity,
+        server_x25519,
+        client_x25519,
+    );
+    let digest = Sha256::digest(&transcript);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
 fn handshake_transcript(
     challenge: &[u8; CHALLENGE_SIZE],
     server_identity: &VerifyingKey,

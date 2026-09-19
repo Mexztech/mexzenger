@@ -468,6 +468,7 @@ fn derive_session_secret(
     my_secret: &x25519_dalek::StaticSecret,
     my_public: &x25519_dalek::PublicKey,
     remote_public: &x25519_dalek::PublicKey,
+    transcript_hash: &[u8; 32],
 ) -> [u8; 32] {
     let shared = my_secret.diffie_hellman(remote_public);
 
@@ -475,12 +476,13 @@ fn derive_session_secret(
 
     public_keys.sort();
 
-    let mut info = Vec::with_capacity(64);
+    let mut info = Vec::with_capacity(96);
 
     info.extend_from_slice(&public_keys[0]);
     info.extend_from_slice(&public_keys[1]);
+    info.extend_from_slice(transcript_hash);
 
-    let hk = Hkdf::<Sha256>::new(Some(b"private-messenger-session"), shared.as_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(b"private-messenger-session-v2"), shared.as_bytes());
 
     let mut session_key = [0u8; 32];
 
@@ -580,7 +582,16 @@ fn start_server(signing_key: &SigningKey) {
 
     println!("Client identity verified");
 
-    let shared_secret = derive_session_secret(&my_secret, &my_public, &remote_x25519);
+    let transcript_hash = handshake::handshake_transcript_hash(
+        &challenge,
+        &server_identity,
+        &remote_identity,
+        &my_public,
+        &remote_x25519,
+    );
+
+    let shared_secret =
+        derive_session_secret(&my_secret, &my_public, &remote_x25519, &transcript_hash);
     let session_id = derive_session_id(&shared_secret);
 
     println!("X25519 handshake successful");
@@ -661,7 +672,16 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     println!("Client identity verified");
 
-    let shared_secret = derive_session_secret(&my_secret, &my_public, &server_x25519);
+    let transcript_hash = handshake::handshake_transcript_hash(
+        &challenge,
+        &server_identity,
+        &client_identity,
+        &server_x25519,
+        &my_public,
+    );
+
+    let shared_secret =
+        derive_session_secret(&my_secret, &my_public, &server_x25519, &transcript_hash);
     let session_id = derive_session_id(&shared_secret);
 
     println!("X25519 handshake successful");
@@ -752,6 +772,29 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_secret_is_symmetric_and_transcript_bound() {
+        let alice_secret = x25519_dalek::StaticSecret::from([1u8; 32]);
+        let bob_secret = x25519_dalek::StaticSecret::from([2u8; 32]);
+
+        let alice_public = x25519_dalek::PublicKey::from(&alice_secret);
+        let bob_public = x25519_dalek::PublicKey::from(&bob_secret);
+
+        let transcript_a = [3u8; 32];
+        let transcript_b = [4u8; 32];
+
+        let alice_key =
+            derive_session_secret(&alice_secret, &alice_public, &bob_public, &transcript_a);
+
+        let bob_key = derive_session_secret(&bob_secret, &bob_public, &alice_public, &transcript_a);
+
+        let modified_transcript_key =
+            derive_session_secret(&alice_secret, &alice_public, &bob_public, &transcript_b);
+
+        assert_eq!(alice_key, bob_key);
+        assert_ne!(alice_key, modified_transcript_key);
+    }
 
     #[test]
     fn packet_constants_are_correct() {
