@@ -614,6 +614,10 @@ fn start_server(signing_key: &SigningKey) {
         receive_public_key(&mut stream).expect("Failed to receive client public key");
     let remote_identity = receive_identity(&mut stream).expect("Failed to receive client identity");
 
+    if !verify_or_pin_identity(&remote_identity) {
+        return;
+    }
+
     let server_identity = signing_key.verifying_key();
     let remote_x25519 = x25519_dalek::PublicKey::from(remote_public);
 
