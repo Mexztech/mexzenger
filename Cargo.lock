@@ -373,6 +373,7 @@ dependencies = [
  "getrandom",
  "hex",
  "hkdf",
+ "hmac",
  "ksi-double-ratchet",
  "rand",
  "rand_core 0.4.2",

@@ -8,6 +8,7 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use ksi_double_ratchet::{DoubleRatchet, Header};
 use rand_core_04::{CryptoRng, Error as RandError, RngCore};
 use rpassword::prompt_password;
@@ -126,6 +127,17 @@ fn receive_signature(stream: &mut TcpStream) -> io::Result<Signature> {
     stream.read_exact(&mut signature_bytes)?;
 
     Ok(Signature::from_bytes(&signature_bytes))
+}
+
+fn send_key_confirmation(stream: &mut TcpStream, confirmation: &[u8; 32]) -> io::Result<()> {
+    stream.write_all(confirmation)?;
+    stream.flush()
+}
+
+fn receive_key_confirmation(stream: &mut TcpStream) -> io::Result<[u8; 32]> {
+    let mut confirmation = [0u8; 32];
+    stream.read_exact(&mut confirmation)?;
+    Ok(confirmation)
 }
 
 fn fingerprint(key: &VerifyingKey) -> String {
@@ -492,6 +504,53 @@ fn derive_session_secret(
     session_key
 }
 
+fn derive_confirmation_key(shared_secret: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"private-messenger-confirmation-v1"), shared_secret);
+
+    let mut confirmation_key = [0u8; 32];
+
+    hk.expand(b"key-confirmation", &mut confirmation_key)
+        .expect("HKDF expansion failed");
+
+    confirmation_key
+}
+
+fn create_key_confirmation(
+    confirmation_key: &[u8; 32],
+    transcript_hash: &[u8; 32],
+    role: &[u8],
+) -> [u8; 32] {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(confirmation_key).expect("HMAC key initialization failed");
+
+    mac.update(b"private-messenger-key-confirmation-v1");
+    mac.update(role);
+    mac.update(transcript_hash);
+
+    let result = mac.finalize().into_bytes();
+
+    let mut confirmation = [0u8; 32];
+    confirmation.copy_from_slice(&result);
+
+    confirmation
+}
+
+fn verify_key_confirmation(
+    confirmation_key: &[u8; 32],
+    transcript_hash: &[u8; 32],
+    role: &[u8],
+    confirmation: &[u8; 32],
+) -> bool {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(confirmation_key).expect("HMAC key initialization failed");
+
+    mac.update(b"private-messenger-key-confirmation-v1");
+    mac.update(role);
+    mac.update(transcript_hash);
+
+    mac.verify_slice(confirmation).is_ok()
+}
+
 fn derive_session_id(shared_secret: &[u8; 32]) -> [u8; 16] {
     let hk = Hkdf::<Sha256>::new(Some(b"private-messenger-session-id"), shared_secret);
 
@@ -592,6 +651,28 @@ fn start_server(signing_key: &SigningKey) {
 
     let shared_secret =
         derive_session_secret(&my_secret, &my_public, &remote_x25519, &transcript_hash);
+
+    let confirmation_key = derive_confirmation_key(&shared_secret);
+    let server_confirmation =
+        create_key_confirmation(&confirmation_key, &transcript_hash, b"server");
+
+    send_key_confirmation(&mut stream, &server_confirmation)
+        .expect("Failed to send server key confirmation");
+
+    let client_confirmation =
+        receive_key_confirmation(&mut stream).expect("Failed to receive client key confirmation");
+
+    if !verify_key_confirmation(
+        &confirmation_key,
+        &transcript_hash,
+        b"client",
+        &client_confirmation,
+    ) {
+        panic!("Client key confirmation FAILED");
+    }
+
+    println!("Mutual key confirmation successful");
+
     let session_id = derive_session_id(&shared_secret);
 
     println!("X25519 handshake successful");
@@ -682,6 +763,29 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     let shared_secret =
         derive_session_secret(&my_secret, &my_public, &server_x25519, &transcript_hash);
+
+    let confirmation_key = derive_confirmation_key(&shared_secret);
+
+    let server_confirmation =
+        receive_key_confirmation(&mut stream).expect("Failed to receive server key confirmation");
+
+    if !verify_key_confirmation(
+        &confirmation_key,
+        &transcript_hash,
+        b"server",
+        &server_confirmation,
+    ) {
+        panic!("Server key confirmation FAILED");
+    }
+
+    let client_confirmation =
+        create_key_confirmation(&confirmation_key, &transcript_hash, b"client");
+
+    send_key_confirmation(&mut stream, &client_confirmation)
+        .expect("Failed to send client key confirmation");
+
+    println!("Mutual key confirmation successful");
+
     let session_id = derive_session_id(&shared_secret);
 
     println!("X25519 handshake successful");
@@ -772,6 +876,57 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_confirmation_is_bound_to_session_transcript_and_role() {
+        let shared_secret = [1u8; 32];
+        let other_secret = [2u8; 32];
+        let transcript = [3u8; 32];
+        let other_transcript = [4u8; 32];
+
+        let key = derive_confirmation_key(&shared_secret);
+        let other_key = derive_confirmation_key(&other_secret);
+
+        let server_confirmation = create_key_confirmation(&key, &transcript, b"server");
+
+        assert!(verify_key_confirmation(
+            &key,
+            &transcript,
+            b"server",
+            &server_confirmation
+        ));
+
+        assert!(!verify_key_confirmation(
+            &key,
+            &transcript,
+            b"client",
+            &server_confirmation
+        ));
+
+        assert!(!verify_key_confirmation(
+            &other_key,
+            &transcript,
+            b"server",
+            &server_confirmation
+        ));
+
+        assert!(!verify_key_confirmation(
+            &key,
+            &other_transcript,
+            b"server",
+            &server_confirmation
+        ));
+
+        let mut tampered = server_confirmation;
+        tampered[0] ^= 1;
+
+        assert!(!verify_key_confirmation(
+            &key,
+            &transcript,
+            b"server",
+            &tampered
+        ));
+    }
 
     #[test]
     fn session_secret_is_symmetric_and_transcript_bound() {
