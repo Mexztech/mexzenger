@@ -193,7 +193,13 @@ impl CryptoProvider for CryptoProviderImpl {
 pub type Ratchet = DoubleRatchet<CryptoProviderImpl>;
 
 pub fn root_key_from_shared_secret(shared_secret: [u8; KEY_SIZE]) -> RootKey {
-    RootKey(shared_secret)
+    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-double-ratchet-v1"), &shared_secret);
+
+    let mut root = [0u8; KEY_SIZE];
+    hkdf.expand(b"root-key", &mut root)
+        .expect("HKDF output length invalid");
+
+    RootKey(root)
 }
 
 pub fn keypair_from_x25519(secret: [u8; KEY_SIZE]) -> KeyPair {
