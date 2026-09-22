@@ -601,9 +601,14 @@ fn start_server(signing_key: &SigningKey) {
     send_challenge(&mut stream, &challenge).expect("Failed to send challenge");
 
     let (my_secret, my_public) = handshake::generate_keypair();
+    let (ratchet_secret, ratchet_public) = handshake::generate_keypair();
+
     send_public_key(&mut stream, my_public.as_bytes()).expect("Failed to send public key");
 
     send_identity_key(&mut stream, signing_key).expect("Failed to send server identity");
+
+    send_public_key(&mut stream, ratchet_public.as_bytes())
+        .expect("Failed to send server ratchet public key");
 
     let remote_public =
         receive_public_key(&mut stream).expect("Failed to receive client public key");
@@ -619,6 +624,7 @@ fn start_server(signing_key: &SigningKey) {
         &remote_identity,
         &my_public,
         &remote_x25519,
+        &ratchet_public,
     );
 
     send_signature(&mut stream, &server_signature)
@@ -635,6 +641,7 @@ fn start_server(signing_key: &SigningKey) {
         &remote_identity,
         &my_public,
         &remote_x25519,
+        &ratchet_public,
     ) {
         panic!("Client transcript verification FAILED");
     }
@@ -647,6 +654,7 @@ fn start_server(signing_key: &SigningKey) {
         &remote_identity,
         &my_public,
         &remote_x25519,
+        &ratchet_public,
     );
 
     let shared_secret =
@@ -677,7 +685,7 @@ fn start_server(signing_key: &SigningKey) {
 
     println!("X25519 handshake successful");
 
-    let ratchet = create_ratchet_bob(shared_secret, *my_secret.as_bytes());
+    let ratchet = create_ratchet_bob(shared_secret, *ratchet_secret.as_bytes());
 
     chat(stream, ratchet, session_id);
 }
@@ -708,7 +716,11 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     let server_identity = receive_identity(&mut stream).expect("Failed to receive server identity");
 
+    let server_ratchet_public =
+        receive_public_key(&mut stream).expect("Failed to receive server ratchet public key");
+
     let server_x25519 = x25519_dalek::PublicKey::from(server_public);
+    let server_ratchet_x25519 = x25519_dalek::PublicKey::from(server_ratchet_public);
 
     println!("Server identity received");
 
@@ -733,6 +745,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         &client_identity,
         &server_x25519,
         &my_public,
+        &server_ratchet_x25519,
     ) {
         panic!("Server transcript verification FAILED");
     }
@@ -746,6 +759,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         &client_identity,
         &server_x25519,
         &my_public,
+        &server_ratchet_x25519,
     );
 
     send_signature(&mut stream, &client_signature)
@@ -759,6 +773,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         &client_identity,
         &server_x25519,
         &my_public,
+        &server_ratchet_x25519,
     );
 
     let shared_secret =
@@ -790,7 +805,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     println!("X25519 handshake successful");
 
-    let ratchet = create_ratchet_alice(shared_secret, server_public);
+    let ratchet = create_ratchet_alice(shared_secret, *server_ratchet_x25519.as_bytes());
 
     chat(stream, ratchet, session_id);
 }

@@ -3,7 +3,7 @@ use rand_core_04::RngCore;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const CHALLENGE_SIZE: usize = 32;
-const HANDSHAKE_DOMAIN: &[u8] = b"private-messenger-handshake-v1";
+const HANDSHAKE_DOMAIN: &[u8] = b"private-messenger-handshake-v2";
 
 pub fn generate_challenge() -> [u8; CHALLENGE_SIZE] {
     let mut challenge = [0u8; CHALLENGE_SIZE];
@@ -32,6 +32,7 @@ pub fn handshake_transcript_hash(
     client_identity: &VerifyingKey,
     server_x25519: &PublicKey,
     client_x25519: &PublicKey,
+    server_ratchet_x25519: &PublicKey,
 ) -> [u8; 32] {
     let transcript = handshake_transcript(
         challenge,
@@ -39,6 +40,7 @@ pub fn handshake_transcript_hash(
         client_identity,
         server_x25519,
         client_x25519,
+        server_ratchet_x25519,
     );
     let digest = Sha256::digest(&transcript);
     let mut hash = [0u8; 32];
@@ -52,9 +54,9 @@ fn handshake_transcript(
     client_identity: &VerifyingKey,
     server_x25519: &PublicKey,
     client_x25519: &PublicKey,
+    server_ratchet_x25519: &PublicKey,
 ) -> Vec<u8> {
-    let mut message =
-        Vec::with_capacity(HANDSHAKE_DOMAIN.len() + 1 + CHALLENGE_SIZE + 32 + 32 + 32 + 32);
+    let mut message = Vec::with_capacity(HANDSHAKE_DOMAIN.len() + 1 + CHALLENGE_SIZE + 32 * 5);
 
     message.extend_from_slice(HANDSHAKE_DOMAIN);
     message.push(1u8); // protocol version
@@ -66,6 +68,7 @@ fn handshake_transcript(
 
     message.extend_from_slice(server_x25519.as_bytes());
     message.extend_from_slice(client_x25519.as_bytes());
+    message.extend_from_slice(server_ratchet_x25519.as_bytes());
 
     message
 }
@@ -77,6 +80,7 @@ pub fn sign_handshake_transcript(
     client_identity: &VerifyingKey,
     server_x25519: &PublicKey,
     client_x25519: &PublicKey,
+    server_ratchet_x25519: &PublicKey,
 ) -> Signature {
     let message = handshake_transcript(
         challenge,
@@ -84,11 +88,13 @@ pub fn sign_handshake_transcript(
         client_identity,
         server_x25519,
         client_x25519,
+        server_ratchet_x25519,
     );
 
     signing_key.sign(&message)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_handshake_transcript(
     verifying_key: &VerifyingKey,
     signature: &Signature,
@@ -97,6 +103,7 @@ pub fn verify_handshake_transcript(
     client_identity: &VerifyingKey,
     server_x25519: &PublicKey,
     client_x25519: &PublicKey,
+    server_ratchet_x25519: &PublicKey,
 ) -> bool {
     let message = handshake_transcript(
         challenge,
@@ -104,6 +111,7 @@ pub fn verify_handshake_transcript(
         client_identity,
         server_x25519,
         client_x25519,
+        server_ratchet_x25519,
     );
 
     verifying_key.verify(&message, signature).is_ok()
@@ -140,6 +148,7 @@ mod tests {
     #[test]
     fn transcript_signature_verifies() {
         let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
 
         let server_identity = server_signing.verifying_key();
         let client_identity = client_signing.verifying_key();
@@ -151,6 +160,7 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         );
 
         assert!(verify_handshake_transcript(
@@ -161,12 +171,14 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         ));
     }
 
     #[test]
     fn transcript_rejects_modified_challenge() {
         let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
 
         let server_identity = server_signing.verifying_key();
         let client_identity = client_signing.verifying_key();
@@ -178,6 +190,7 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         );
 
         let mut modified = challenge;
@@ -191,12 +204,14 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         ));
     }
 
     #[test]
     fn transcript_rejects_modified_client_key() {
         let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
 
         let server_identity = server_signing.verifying_key();
         let client_identity = client_signing.verifying_key();
@@ -208,6 +223,7 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         );
 
         let modified_client_x25519 = PublicKey::from(&StaticSecret::from([12u8; 32]));
@@ -220,12 +236,14 @@ mod tests {
             &client_identity,
             &server_x25519,
             &modified_client_x25519,
+            &server_ratchet_x25519,
         ));
     }
 
     #[test]
     fn transcript_rejects_modified_client_identity() {
         let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
 
         let server_identity = server_signing.verifying_key();
         let client_identity = client_signing.verifying_key();
@@ -237,6 +255,7 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         );
 
         let other_client = SigningKey::from_bytes(&[13u8; 32]);
@@ -250,12 +269,14 @@ mod tests {
             &modified_client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         ));
     }
 
     #[test]
     fn transcript_rejects_modified_server_key() {
         let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
 
         let server_identity = server_signing.verifying_key();
         let client_identity = client_signing.verifying_key();
@@ -267,6 +288,7 @@ mod tests {
             &client_identity,
             &server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
         );
 
         let modified_server_x25519 = PublicKey::from(&StaticSecret::from([14u8; 32]));
@@ -279,6 +301,39 @@ mod tests {
             &client_identity,
             &modified_server_x25519,
             &client_x25519,
+            &server_ratchet_x25519,
+        ));
+    }
+
+    #[test]
+    fn transcript_rejects_modified_server_ratchet_key() {
+        let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
+
+        let server_identity = server_signing.verifying_key();
+        let client_identity = client_signing.verifying_key();
+
+        let signature = sign_handshake_transcript(
+            &server_signing,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+
+        let modified_server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([16u8; 32]));
+
+        assert!(!verify_handshake_transcript(
+            &server_identity,
+            &signature,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &modified_server_ratchet_x25519,
         ));
     }
 }
