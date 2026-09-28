@@ -405,6 +405,13 @@ fn receive_ratchet_message(
 }
 
 fn chat(mut stream: TcpStream, ratchet: Ratchet, session_id: [u8; 16]) {
+    stream
+        .set_read_timeout(None)
+        .expect("Could not disable read timeout");
+    stream
+        .set_write_timeout(None)
+        .expect("Could not disable write timeout");
+
     let ratchet = Arc::new(Mutex::new(ratchet));
 
     let receive_ratchet = Arc::clone(&ratchet);
