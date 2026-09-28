@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ratchet::{
-    CryptoProviderImpl, PublicKey as RatchetPublicKey, Ratchet, keypair_from_x25519,
+    ChainKey, CryptoProviderImpl, PublicKey as RatchetPublicKey, Ratchet, keypair_from_x25519,
     root_key_from_shared_secret,
 };
 
@@ -568,22 +568,32 @@ fn derive_session_id(shared_secret: &[u8; 32]) -> [u8; 16] {
     session_id
 }
 
+fn initial_send_chain_key(shared_secret: [u8; 32]) -> ChainKey {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-initial-send-v1"), &shared_secret);
+    let mut key = [0u8; 32];
+    hkdf.expand(b"initial-send-chain", &mut key)
+        .expect("HKDF expansion failed");
+    ChainKey(key)
+}
+
 fn create_ratchet_alice(shared_secret: [u8; 32], remote_public: [u8; 32]) -> Ratchet {
     let root = root_key_from_shared_secret(shared_secret);
 
     let remote = RatchetPublicKey(remote_public);
+    let initial_send = initial_send_chain_key(shared_secret);
 
     let mut rng = SystemRng;
 
-    DoubleRatchet::<CryptoProviderImpl>::new_alice(&root, remote, None, &mut rng)
+    DoubleRatchet::<CryptoProviderImpl>::new_alice(&root, remote, Some(initial_send), &mut rng)
 }
 
 fn create_ratchet_bob(shared_secret: [u8; 32], my_secret: [u8; 32]) -> Ratchet {
     let root = root_key_from_shared_secret(shared_secret);
 
     let keypair = keypair_from_x25519(my_secret);
+    let initial_send = initial_send_chain_key(shared_secret);
 
-    DoubleRatchet::<CryptoProviderImpl>::new_bob(root, keypair, None)
+    DoubleRatchet::<CryptoProviderImpl>::new_bob(root, keypair, Some(initial_send))
 }
 
 fn start_server(signing_key: &SigningKey) {
