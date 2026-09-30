@@ -755,8 +755,13 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     let client_identity = signing_key.verifying_key();
 
-    let server_signature =
-        receive_signature(&mut stream).expect("Failed to receive server transcript signature");
+    let server_signature = match receive_signature(&mut stream) {
+        Ok(signature) => signature,
+        Err(error) => {
+            eprintln!("Connection closed during handshake: {}", error);
+            return;
+        }
+    };
 
     if !handshake::verify_handshake_transcript(
         &server_identity,
@@ -1086,6 +1091,128 @@ mod tests {
         let ratchet = Arc::new(Mutex::new(ratchet));
 
         assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
+    }
+
+    #[test]
+    fn wrong_protocol_version_is_rejected() {
+        let session_id = generate_session_id();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let mut packet = vec![0u8; PACKET_SIZE];
+        packet[0] = PROTOCOL_VERSION.wrapping_add(1);
+        packet[1] = MESSAGE_TYPE_TEXT;
+        packet[2..18].copy_from_slice(&session_id);
+
+        client
+            .write_all(&(PACKET_SIZE as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(&packet).unwrap();
+
+        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = Arc::new(Mutex::new(ratchet));
+
+        assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
+    }
+
+    #[test]
+    fn wrong_message_type_is_rejected() {
+        let session_id = generate_session_id();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let mut packet = vec![0u8; PACKET_SIZE];
+        packet[0] = PROTOCOL_VERSION;
+        packet[1] = MESSAGE_TYPE_TEXT.wrapping_add(1);
+        packet[2..18].copy_from_slice(&session_id);
+
+        client
+            .write_all(&(PACKET_SIZE as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(&packet).unwrap();
+
+        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = Arc::new(Mutex::new(ratchet));
+
+        assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
+    }
+
+    #[test]
+    fn wrong_session_id_is_rejected() {
+        let session_id = generate_session_id();
+        let wrong_session_id = generate_session_id();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let mut packet = vec![0u8; PACKET_SIZE];
+        packet[0] = PROTOCOL_VERSION;
+        packet[1] = MESSAGE_TYPE_TEXT;
+        packet[2..18].copy_from_slice(&wrong_session_id);
+
+        client
+            .write_all(&(PACKET_SIZE as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(&packet).unwrap();
+
+        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = Arc::new(Mutex::new(ratchet));
+
+        assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
+    }
+
+    #[test]
+    fn corrupted_ratchet_header_is_rejected() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let alice = create_ratchet_alice(
+            shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let bob = create_ratchet_bob(shared_secret, bob_secret);
+
+        let alice = Arc::new(Mutex::new(alice));
+        let bob = Arc::new(Mutex::new(bob));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let message = pad_message(b"header corruption test").unwrap();
+        let mut rng = SystemRng;
+
+        let mut ratchet = alice.lock().unwrap();
+        let (header, ciphertext) =
+            ratchet.ratchet_encrypt(&message, &packet_associated_data(&session_id), &mut rng);
+        drop(ratchet);
+
+        let mut packet = Vec::with_capacity(PACKET_SIZE);
+        packet.extend_from_slice(&[PROTOCOL_VERSION]);
+        packet.extend_from_slice(&[MESSAGE_TYPE_TEXT]);
+        packet.extend_from_slice(&session_id);
+        packet.extend_from_slice(header.dh.as_ref());
+        packet.extend_from_slice(&header.n.to_be_bytes());
+        packet.extend_from_slice(&header.pn.to_be_bytes());
+        packet.extend_from_slice(&ciphertext);
+
+        packet[18] ^= 1;
+
+        client
+            .write_all(&(PACKET_SIZE as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(&packet).unwrap();
+
+        assert!(receive_ratchet_message(&mut server, &bob, &session_id).is_err());
     }
 
     #[test]
