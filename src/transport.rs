@@ -1,10 +1,28 @@
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 
 pub trait Transport: Read + Write + Send {
     fn try_clone_transport(&self) -> io::Result<Box<dyn Transport>>;
     fn clear_timeouts(&self) -> io::Result<()>;
     fn set_handshake_timeouts(&self) -> io::Result<()>;
+}
+
+pub trait TransportListener: Send {
+    fn accept(&self) -> io::Result<(Box<dyn Transport>, String)>;
+}
+
+impl Transport for Box<dyn Transport> {
+    fn try_clone_transport(&self) -> io::Result<Box<dyn Transport>> {
+        (**self).try_clone_transport()
+    }
+
+    fn clear_timeouts(&self) -> io::Result<()> {
+        (**self).clear_timeouts()
+    }
+
+    fn set_handshake_timeouts(&self) -> io::Result<()> {
+        (**self).set_handshake_timeouts()
+    }
 }
 
 impl Transport for TcpStream {
@@ -25,14 +43,20 @@ impl Transport for TcpStream {
     }
 }
 
-pub fn listen(address: &str) -> io::Result<TcpListener> {
-    TcpListener::bind(address)
+struct TcpTransportListener(TcpListener);
+
+impl TransportListener for TcpTransportListener {
+    fn accept(&self) -> io::Result<(Box<dyn Transport>, String)> {
+        let (stream, address) = self.0.accept()?;
+        Ok((Box::new(stream), address.to_string()))
+    }
 }
 
-pub fn accept(listener: &TcpListener) -> io::Result<(TcpStream, SocketAddr)> {
-    listener.accept()
+pub fn listen(address: &str) -> io::Result<Box<dyn TransportListener>> {
+    let listener = TcpListener::bind(address)?;
+    Ok(Box::new(TcpTransportListener(listener)))
 }
 
-pub fn connect(address: &str) -> io::Result<TcpStream> {
-    TcpStream::connect(address)
+pub fn connect(address: &str) -> io::Result<Box<dyn Transport>> {
+    Ok(Box::new(TcpStream::connect(address)?))
 }

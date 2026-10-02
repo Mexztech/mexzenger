@@ -622,7 +622,7 @@ fn start_server(signing_key: &SigningKey) -> io::Result<()> {
     println!("Listening on port 9000...");
     println!("Waiting for connection...");
 
-    let (mut stream, address) = transport::accept(&listener)?;
+    let (mut stream, address) = listener.accept()?;
 
     println!("Connected to {}", address);
 
