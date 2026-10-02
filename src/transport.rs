@@ -3,8 +3,13 @@ use std::net::{TcpListener, TcpStream};
 
 pub trait Transport: Read + Write + Send {
     fn try_clone_transport(&self) -> io::Result<Box<dyn Transport>>;
-    fn clear_timeouts(&self) -> io::Result<()>;
-    fn set_handshake_timeouts(&self) -> io::Result<()>;
+    fn clear_timeouts(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_handshake_timeouts(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub trait TransportListener: Send {
