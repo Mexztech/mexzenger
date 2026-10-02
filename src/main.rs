@@ -626,7 +626,7 @@ fn start_server(signing_key: &SigningKey) -> io::Result<()> {
 
     println!("Connected to {}", address);
 
-    transport::set_handshake_timeouts(&stream)?;
+    stream.set_handshake_timeouts()?;
 
     let challenge = handshake::generate_challenge();
     send_challenge(&mut stream, &challenge)?;
@@ -736,7 +736,7 @@ fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
 
     let mut stream = transport::connect(address)?;
 
-    transport::set_handshake_timeouts(&stream)?;
+    stream.set_handshake_timeouts()?;
 
     println!("Connected");
 
