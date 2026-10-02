@@ -18,4 +18,4 @@ rand_core_04 = { package = "rand_core", version = "0.4.2" }
 rpassword = "7.5.4"
 sha2 = "0.11.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
-zeroize = "1.9.0"
+zeroize = { version = "1.9.0", features = ["derive"] }

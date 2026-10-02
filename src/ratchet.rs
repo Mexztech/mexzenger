@@ -8,6 +8,7 @@ use rand_core_04::{CryptoRng, RngCore};
 use sha2::Sha256;
 use std::hash::Hash;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const KEY_SIZE: usize = 32;
 
@@ -69,19 +70,27 @@ impl DrKeyPair for KeyPair {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct RootKey(pub [u8; KEY_SIZE]);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct ChainKey(pub [u8; KEY_SIZE]);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct MessageKey(pub [u8; KEY_SIZE]);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SharedSecret(pub [u8; KEY_SIZE]);
 
 pub struct CryptoProviderImpl;
+
+pub(crate) fn is_valid_x25519_public_key(bytes: &[u8; KEY_SIZE]) -> bool {
+    let public = X25519PublicKey::from(*bytes);
+    let validator_secret = StaticSecret::from([0x42u8; KEY_SIZE]);
+    let shared = validator_secret.diffie_hellman(&public);
+
+    !shared.as_bytes().iter().all(|&b| b == 0)
+}
 
 fn hkdf_expand(key: &[u8], info: &[u8]) -> [u8; KEY_SIZE] {
     let hkdf = Hkdf::<Sha256>::new(None, key);
@@ -192,8 +201,8 @@ impl CryptoProvider for CryptoProviderImpl {
 
 pub type Ratchet = DoubleRatchet<CryptoProviderImpl>;
 
-pub fn root_key_from_shared_secret(shared_secret: [u8; KEY_SIZE]) -> RootKey {
-    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-double-ratchet-v1"), &shared_secret);
+pub fn root_key_from_shared_secret(shared_secret: &[u8; KEY_SIZE]) -> RootKey {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-double-ratchet-v1"), shared_secret);
 
     let mut root = [0u8; KEY_SIZE];
     hkdf.expand(b"root-key", &mut root)

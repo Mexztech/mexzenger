@@ -1,5 +1,6 @@
 mod handshake;
 mod ratchet;
+mod transport;
 
 use argon2::Argon2;
 use chacha20poly1305::{
@@ -14,11 +15,12 @@ use rand_core_04::{CryptoRng, Error as RandError, RngCore};
 use rpassword::prompt_password;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use transport::Transport;
+use zeroize::Zeroizing;
 
 use ratchet::{
     ChainKey, CryptoProviderImpl, PublicKey as RatchetPublicKey, Ratchet, keypair_from_x25519,
@@ -76,26 +78,28 @@ impl RngCore for SystemRng {
 
 impl CryptoRng for SystemRng {}
 
-fn send_public_key(stream: &mut TcpStream, public_key: &[u8; 32]) -> io::Result<()> {
+fn send_public_key<T: Transport + ?Sized>(stream: &mut T, public_key: &[u8; 32]) -> io::Result<()> {
     stream.write_all(public_key)?;
     stream.flush()
 }
 
-fn receive_public_key(stream: &mut TcpStream) -> io::Result<[u8; 32]> {
+fn receive_public_key<T: Transport + ?Sized>(stream: &mut T) -> io::Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     stream.read_exact(&mut bytes)?;
     Ok(bytes)
 }
 
-fn send_challenge(
-    stream: &mut TcpStream,
+fn send_challenge<T: Transport + ?Sized>(
+    stream: &mut T,
     challenge: &[u8; handshake::CHALLENGE_SIZE],
 ) -> io::Result<()> {
     stream.write_all(challenge)?;
     stream.flush()
 }
 
-fn receive_challenge(stream: &mut TcpStream) -> io::Result<[u8; handshake::CHALLENGE_SIZE]> {
+fn receive_challenge<T: Transport + ?Sized>(
+    stream: &mut T,
+) -> io::Result<[u8; handshake::CHALLENGE_SIZE]> {
     let mut challenge = [0u8; handshake::CHALLENGE_SIZE];
 
     stream.read_exact(&mut challenge)?;
@@ -103,18 +107,21 @@ fn receive_challenge(stream: &mut TcpStream) -> io::Result<[u8; handshake::CHALL
     Ok(challenge)
 }
 
-fn send_identity_key(stream: &mut TcpStream, signing_key: &SigningKey) -> io::Result<()> {
+fn send_identity_key<T: Transport + ?Sized>(
+    stream: &mut T,
+    signing_key: &SigningKey,
+) -> io::Result<()> {
     let verifying_key = signing_key.verifying_key();
     stream.write_all(verifying_key.as_bytes())?;
     stream.flush()
 }
 
-fn send_signature(stream: &mut TcpStream, signature: &Signature) -> io::Result<()> {
+fn send_signature<T: Transport + ?Sized>(stream: &mut T, signature: &Signature) -> io::Result<()> {
     stream.write_all(signature.to_bytes().as_ref())?;
     stream.flush()
 }
 
-fn receive_identity(stream: &mut TcpStream) -> io::Result<VerifyingKey> {
+fn receive_identity<T: Transport + ?Sized>(stream: &mut T) -> io::Result<VerifyingKey> {
     let mut identity_bytes = [0u8; 32];
     stream.read_exact(&mut identity_bytes)?;
 
@@ -122,21 +129,26 @@ fn receive_identity(stream: &mut TcpStream) -> io::Result<VerifyingKey> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid identity key"))
 }
 
-fn receive_signature(stream: &mut TcpStream) -> io::Result<Signature> {
+fn receive_signature<T: Transport + ?Sized>(stream: &mut T) -> io::Result<Signature> {
     let mut signature_bytes = [0u8; 64];
     stream.read_exact(&mut signature_bytes)?;
 
     Ok(Signature::from_bytes(&signature_bytes))
 }
 
-fn send_key_confirmation(stream: &mut TcpStream, confirmation: &[u8; 32]) -> io::Result<()> {
+fn send_key_confirmation<T: Transport + ?Sized>(
+    stream: &mut T,
+    confirmation: &[u8; 32],
+) -> io::Result<()> {
     stream.write_all(confirmation)?;
     stream.flush()
 }
 
-fn receive_key_confirmation(stream: &mut TcpStream) -> io::Result<[u8; 32]> {
-    let mut confirmation = [0u8; 32];
-    stream.read_exact(&mut confirmation)?;
+fn receive_key_confirmation<T: Transport + ?Sized>(
+    stream: &mut T,
+) -> io::Result<Zeroizing<[u8; 32]>> {
+    let mut confirmation = Zeroizing::new([0u8; 32]);
+    stream.read_exact(&mut *confirmation)?;
     Ok(confirmation)
 }
 
@@ -269,8 +281,8 @@ fn pad_message(message: &[u8]) -> io::Result<Vec<u8>> {
     Ok(padded)
 }
 
-fn send_ratchet_message(
-    stream: &mut TcpStream,
+fn send_ratchet_message<T: Transport + ?Sized>(
+    stream: &mut T,
     ratchet: &Arc<Mutex<Ratchet>>,
     session_id: &[u8; 16],
     message: &[u8],
@@ -336,8 +348,8 @@ fn unpad_message(padded: &[u8]) -> io::Result<Vec<u8>> {
     Ok(padded[4..4 + message_len].to_vec())
 }
 
-fn receive_ratchet_message(
-    stream: &mut TcpStream,
+fn receive_ratchet_message<T: Transport + ?Sized>(
+    stream: &mut T,
     ratchet: &Arc<Mutex<Ratchet>>,
     session_id: &[u8; 16],
 ) -> io::Result<Vec<u8>> {
@@ -372,6 +384,13 @@ fn receive_ratchet_message(
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid ratchet public key"))?;
 
+    if !ratchet::is_valid_x25519_public_key(&dh_bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid ratchet public key",
+        ));
+    }
+
     let n_bytes: [u8; 4] = packet[50..54]
         .try_into()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid message counter"))?;
@@ -404,25 +423,24 @@ fn receive_ratchet_message(
     unpad_message(&padded_message)
 }
 
-fn chat(mut stream: TcpStream, ratchet: Ratchet, session_id: [u8; 16]) {
-    stream
-        .set_read_timeout(None)
-        .expect("Could not disable read timeout");
-    stream
-        .set_write_timeout(None)
-        .expect("Could not disable write timeout");
+fn chat<T: Transport + 'static>(
+    mut stream: T,
+    ratchet: Ratchet,
+    session_id: [u8; 16],
+) -> io::Result<()> {
+    stream.clear_timeouts()?;
 
     let ratchet = Arc::new(Mutex::new(ratchet));
 
     let receive_ratchet = Arc::clone(&ratchet);
 
-    let receive_stream = stream.try_clone().expect("Could not clone TCP stream");
+    let receive_stream = stream.try_clone_transport()?;
 
     thread::spawn(move || {
         let mut stream = receive_stream;
 
         loop {
-            match receive_ratchet_message(&mut stream, &receive_ratchet, &session_id) {
+            match receive_ratchet_message(&mut *stream, &receive_ratchet, &session_id) {
                 Ok(message) => {
                     println!();
                     println!("Friend: {}", String::from_utf8_lossy(&message));
@@ -481,6 +499,8 @@ fn chat(mut stream: TcpStream, ratchet: Ratchet, session_id: [u8; 16]) {
         print!("You: ");
         io::stdout().flush().ok();
     }
+
+    Ok(())
 }
 
 fn derive_session_secret(
@@ -488,7 +508,7 @@ fn derive_session_secret(
     my_public: &x25519_dalek::PublicKey,
     remote_public: &x25519_dalek::PublicKey,
     transcript_hash: &[u8; 32],
-) -> [u8; 32] {
+) -> Zeroizing<[u8; 32]> {
     let shared = my_secret.diffie_hellman(remote_public);
 
     let mut public_keys = [*my_public.as_bytes(), *remote_public.as_bytes()];
@@ -503,20 +523,20 @@ fn derive_session_secret(
 
     let hk = Hkdf::<Sha256>::new(Some(b"private-messenger-session-v2"), shared.as_bytes());
 
-    let mut session_key = [0u8; 32];
+    let mut session_key = Zeroizing::new([0u8; 32]);
 
-    hk.expand(&info, &mut session_key)
+    hk.expand(&info, &mut *session_key)
         .expect("HKDF expansion failed");
 
     session_key
 }
 
-fn derive_confirmation_key(shared_secret: &[u8; 32]) -> [u8; 32] {
+fn derive_confirmation_key(shared_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(b"private-messenger-confirmation-v1"), shared_secret);
 
-    let mut confirmation_key = [0u8; 32];
+    let mut confirmation_key = Zeroizing::new([0u8; 32]);
 
-    hk.expand(b"key-confirmation", &mut confirmation_key)
+    hk.expand(b"key-confirmation", &mut *confirmation_key)
         .expect("HKDF expansion failed");
 
     confirmation_key
@@ -526,7 +546,7 @@ fn create_key_confirmation(
     confirmation_key: &[u8; 32],
     transcript_hash: &[u8; 32],
     role: &[u8],
-) -> [u8; 32] {
+) -> Zeroizing<[u8; 32]> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(confirmation_key).expect("HMAC key initialization failed");
 
@@ -536,7 +556,7 @@ fn create_key_confirmation(
 
     let result = mac.finalize().into_bytes();
 
-    let mut confirmation = [0u8; 32];
+    let mut confirmation = Zeroizing::new([0u8; 32]);
     confirmation.copy_from_slice(&result);
 
     confirmation
@@ -568,15 +588,15 @@ fn derive_session_id(shared_secret: &[u8; 32]) -> [u8; 16] {
     session_id
 }
 
-fn initial_send_chain_key(shared_secret: [u8; 32]) -> ChainKey {
-    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-initial-send-v1"), &shared_secret);
+fn initial_send_chain_key(shared_secret: &[u8; 32]) -> ChainKey {
+    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-initial-send-v1"), shared_secret);
     let mut key = [0u8; 32];
     hkdf.expand(b"initial-send-chain", &mut key)
         .expect("HKDF expansion failed");
     ChainKey(key)
 }
 
-fn create_ratchet_alice(shared_secret: [u8; 32], remote_public: [u8; 32]) -> Ratchet {
+fn create_ratchet_alice(shared_secret: &[u8; 32], remote_public: [u8; 32]) -> Ratchet {
     let root = root_key_from_shared_secret(shared_secret);
 
     let remote = RatchetPublicKey(remote_public);
@@ -587,7 +607,7 @@ fn create_ratchet_alice(shared_secret: [u8; 32], remote_public: [u8; 32]) -> Rat
     DoubleRatchet::<CryptoProviderImpl>::new_alice(&root, remote, Some(initial_send), &mut rng)
 }
 
-fn create_ratchet_bob(shared_secret: [u8; 32], my_secret: [u8; 32]) -> Ratchet {
+fn create_ratchet_bob(shared_secret: &[u8; 32], my_secret: [u8; 32]) -> Ratchet {
     let root = root_key_from_shared_secret(shared_secret);
 
     let keypair = keypair_from_x25519(my_secret);
@@ -596,43 +616,41 @@ fn create_ratchet_bob(shared_secret: [u8; 32], my_secret: [u8; 32]) -> Ratchet {
     DoubleRatchet::<CryptoProviderImpl>::new_bob(root, keypair, Some(initial_send))
 }
 
-fn start_server(signing_key: &SigningKey) {
-    let listener = TcpListener::bind("0.0.0.0:9000").expect("Could not start server");
+fn start_server(signing_key: &SigningKey) -> io::Result<()> {
+    let listener = transport::listen("0.0.0.0:9000")?;
 
     println!("Listening on port 9000...");
     println!("Waiting for connection...");
 
-    let (mut stream, address) = listener.accept().expect("Could not accept connection");
+    let (mut stream, address) = transport::accept(&listener)?;
 
     println!("Connected to {}", address);
 
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .expect("Could not set read timeout");
-
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(30)))
-        .expect("Could not set write timeout");
+    transport::set_handshake_timeouts(&stream)?;
 
     let challenge = handshake::generate_challenge();
-    send_challenge(&mut stream, &challenge).expect("Failed to send challenge");
+    send_challenge(&mut stream, &challenge)?;
 
     let (my_secret, my_public) = handshake::generate_keypair();
     let (ratchet_secret, ratchet_public) = handshake::generate_keypair();
 
-    send_public_key(&mut stream, my_public.as_bytes()).expect("Failed to send public key");
+    send_public_key(&mut stream, my_public.as_bytes())?;
 
-    send_identity_key(&mut stream, signing_key).expect("Failed to send server identity");
+    send_identity_key(&mut stream, signing_key)?;
 
-    send_public_key(&mut stream, ratchet_public.as_bytes())
-        .expect("Failed to send server ratchet public key");
+    send_public_key(&mut stream, ratchet_public.as_bytes())?;
 
-    let remote_public =
-        receive_public_key(&mut stream).expect("Failed to receive client public key");
-    let remote_identity = receive_identity(&mut stream).expect("Failed to receive client identity");
+    let remote_public = receive_public_key(&mut stream)?;
+    if !ratchet::is_valid_x25519_public_key(&remote_public) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid peer X25519 public key",
+        ));
+    }
+    let remote_identity = receive_identity(&mut stream)?;
 
     if !verify_or_pin_identity(&remote_identity) {
-        return;
+        return Ok(());
     }
 
     let server_identity = signing_key.verifying_key();
@@ -648,11 +666,9 @@ fn start_server(signing_key: &SigningKey) {
         &ratchet_public,
     );
 
-    send_signature(&mut stream, &server_signature)
-        .expect("Failed to send server transcript signature");
+    send_signature(&mut stream, &server_signature)?;
 
-    let client_signature =
-        receive_signature(&mut stream).expect("Failed to receive client transcript signature");
+    let client_signature = receive_signature(&mut stream)?;
 
     if !handshake::verify_handshake_transcript(
         &remote_identity,
@@ -664,7 +680,10 @@ fn start_server(signing_key: &SigningKey) {
         &remote_x25519,
         &ratchet_public,
     ) {
-        panic!("Client transcript verification FAILED");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Client transcript verification failed",
+        ));
     }
 
     println!("Client identity verified");
@@ -685,11 +704,9 @@ fn start_server(signing_key: &SigningKey) {
     let server_confirmation =
         create_key_confirmation(&confirmation_key, &transcript_hash, b"server");
 
-    send_key_confirmation(&mut stream, &server_confirmation)
-        .expect("Failed to send server key confirmation");
+    send_key_confirmation(&mut stream, &server_confirmation)?;
 
-    let client_confirmation =
-        receive_key_confirmation(&mut stream).expect("Failed to receive client key confirmation");
+    let client_confirmation = receive_key_confirmation(&mut stream)?;
 
     if !verify_key_confirmation(
         &confirmation_key,
@@ -697,7 +714,10 @@ fn start_server(signing_key: &SigningKey) {
         b"client",
         &client_confirmation,
     ) {
-        panic!("Client key confirmation FAILED");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Client key confirmation failed",
+        ));
     }
 
     println!("Mutual key confirmation successful");
@@ -706,39 +726,43 @@ fn start_server(signing_key: &SigningKey) {
 
     println!("X25519 handshake successful");
 
-    let ratchet = create_ratchet_bob(shared_secret, *ratchet_secret.as_bytes());
+    let ratchet = create_ratchet_bob(&shared_secret, *ratchet_secret.as_bytes());
 
-    chat(stream, ratchet, session_id);
+    chat(stream, ratchet, session_id)
 }
 
-fn start_client(address: &str, signing_key: &SigningKey) {
+fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
     println!("Connecting to {}...", address);
 
-    let mut stream = TcpStream::connect(address).expect("Could not connect");
+    let mut stream = transport::connect(address)?;
 
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .expect("Could not set read timeout");
-
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(30)))
-        .expect("Could not set write timeout");
+    transport::set_handshake_timeouts(&stream)?;
 
     println!("Connected");
 
-    let challenge = receive_challenge(&mut stream).expect("Failed to receive challenge");
+    let challenge = receive_challenge(&mut stream)?;
 
     let (my_secret, my_public) = handshake::generate_keypair();
 
-    let server_public =
-        receive_public_key(&mut stream).expect("Failed to receive server public key");
+    let server_public = receive_public_key(&mut stream)?;
+    if !ratchet::is_valid_x25519_public_key(&server_public) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid server X25519 public key",
+        ));
+    }
 
     println!("Server X25519 public key received");
 
-    let server_identity = receive_identity(&mut stream).expect("Failed to receive server identity");
+    let server_identity = receive_identity(&mut stream)?;
 
-    let server_ratchet_public =
-        receive_public_key(&mut stream).expect("Failed to receive server ratchet public key");
+    let server_ratchet_public = receive_public_key(&mut stream)?;
+    if !ratchet::is_valid_x25519_public_key(&server_ratchet_public) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid server ratchet X25519 public key",
+        ));
+    }
 
     let server_x25519 = x25519_dalek::PublicKey::from(server_public);
     let server_ratchet_x25519 = x25519_dalek::PublicKey::from(server_ratchet_public);
@@ -746,12 +770,12 @@ fn start_client(address: &str, signing_key: &SigningKey) {
     println!("Server identity received");
 
     if !verify_or_pin_identity(&server_identity) {
-        return;
+        return Ok(());
     }
 
-    send_public_key(&mut stream, my_public.as_bytes()).expect("Failed to send client public key");
+    send_public_key(&mut stream, my_public.as_bytes())?;
 
-    send_identity_key(&mut stream, signing_key).expect("Failed to send client identity");
+    send_identity_key(&mut stream, signing_key)?;
 
     let client_identity = signing_key.verifying_key();
 
@@ -759,7 +783,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         Ok(signature) => signature,
         Err(error) => {
             eprintln!("Connection closed during handshake: {}", error);
-            return;
+            return Ok(());
         }
     };
 
@@ -773,7 +797,10 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         &my_public,
         &server_ratchet_x25519,
     ) {
-        panic!("Server transcript verification FAILED");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Server transcript verification failed",
+        ));
     }
 
     println!("Server transcript verified");
@@ -788,8 +815,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         &server_ratchet_x25519,
     );
 
-    send_signature(&mut stream, &client_signature)
-        .expect("Failed to send client transcript signature");
+    send_signature(&mut stream, &client_signature)?;
 
     println!("Client identity verified");
 
@@ -807,8 +833,7 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     let confirmation_key = derive_confirmation_key(&shared_secret);
 
-    let server_confirmation =
-        receive_key_confirmation(&mut stream).expect("Failed to receive server key confirmation");
+    let server_confirmation = receive_key_confirmation(&mut stream)?;
 
     if !verify_key_confirmation(
         &confirmation_key,
@@ -816,14 +841,16 @@ fn start_client(address: &str, signing_key: &SigningKey) {
         b"server",
         &server_confirmation,
     ) {
-        panic!("Server key confirmation FAILED");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Server key confirmation failed",
+        ));
     }
 
     let client_confirmation =
         create_key_confirmation(&confirmation_key, &transcript_hash, b"client");
 
-    send_key_confirmation(&mut stream, &client_confirmation)
-        .expect("Failed to send client key confirmation");
+    send_key_confirmation(&mut stream, &client_confirmation)?;
 
     println!("Mutual key confirmation successful");
 
@@ -831,39 +858,53 @@ fn start_client(address: &str, signing_key: &SigningKey) {
 
     println!("X25519 handshake successful");
 
-    let ratchet = create_ratchet_alice(shared_secret, *server_ratchet_x25519.as_bytes());
+    let ratchet = create_ratchet_alice(&shared_secret, *server_ratchet_x25519.as_bytes());
 
-    chat(stream, ratchet, session_id);
+    chat(stream, ratchet, session_id)
 }
 
-fn unlock_device() -> SigningKey {
-    let data = fs::read("device.key").expect("Could not read device.key");
+fn unlock_device() -> io::Result<SigningKey> {
+    let data = fs::read("device.key")?;
 
     if data.len() < 28 {
-        panic!("device.key is invalid");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "device.key is invalid",
+        ));
     }
 
     let salt = &data[0..16];
     let nonce_bytes = &data[16..28];
     let encrypted_key = &data[28..];
 
-    let password = prompt_password("Device password: ").expect("Could not read password");
+    let password = Zeroizing::new(
+        prompt_password("Device password: ")
+            .map_err(|error| io::Error::other(format!("Could not read password: {}", error)))?,
+    );
 
-    let mut encryption_key = [0u8; 32];
+    let mut encryption_key = Zeroizing::new([0u8; 32]);
 
     Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut encryption_key)
-        .expect("Key derivation failed");
+        .hash_password_into(password.as_bytes(), salt, &mut *encryption_key)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key derivation failed"))?;
 
-    let cipher = ChaCha20Poly1305::new(&Key::from(encryption_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*encryption_key));
 
-    let nonce = Nonce::try_from(nonce_bytes).expect("Invalid nonce");
+    let nonce = Nonce::try_from(nonce_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid nonce"))?;
 
-    let private_key = cipher
-        .decrypt(&nonce, encrypted_key)
-        .expect("Wrong password or corrupted device.key");
+    let private_key = cipher.decrypt(&nonce, encrypted_key).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Wrong password or corrupted device.key",
+        )
+    })?;
 
-    let private_key: [u8; 32] = private_key.try_into().expect("Invalid private key");
+    let private_key: Zeroizing<[u8; 32]> = Zeroizing::new(
+        private_key
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid private key"))?,
+    );
 
     let signing_key = SigningKey::from_bytes(&private_key);
 
@@ -872,13 +913,13 @@ fn unlock_device() -> SigningKey {
     println!("Device unlocked");
     println!("Identity fingerprint: {}", fingerprint(&verifying_key));
 
-    signing_key
+    Ok(signing_key)
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     println!("Private Messenger");
 
-    let signing_key = unlock_device();
+    let signing_key = unlock_device()?;
 
     println!();
     println!("Network");
@@ -887,13 +928,11 @@ fn main() {
 
     let mut input = String::new();
 
-    io::stdin()
-        .read_line(&mut input)
-        .expect("Failed to read input");
+    io::stdin().read_line(&mut input)?;
 
     match input.trim() {
         "1" => {
-            start_server(&signing_key);
+            start_server(&signing_key)?;
         }
 
         "2" => {
@@ -901,22 +940,74 @@ fn main() {
 
             input.clear();
 
-            io::stdin()
-                .read_line(&mut input)
-                .expect("Failed to read address");
+            io::stdin().read_line(&mut input)?;
 
-            start_client(input.trim(), &signing_key);
+            start_client(input.trim(), &signing_key)?;
         }
 
         _ => {
             println!("Invalid choice");
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn key_confirmation_roles_cannot_be_swapped() {
+        let shared_secret = [81u8; 32];
+        let transcript_hash = [82u8; 32];
+        let key = derive_confirmation_key(&shared_secret);
+
+        let server_confirmation = create_key_confirmation(&key, &transcript_hash, b"server");
+        let client_confirmation = create_key_confirmation(&key, &transcript_hash, b"client");
+
+        assert!(!verify_key_confirmation(
+            &key,
+            &transcript_hash,
+            b"client",
+            &server_confirmation,
+        ));
+
+        assert!(!verify_key_confirmation(
+            &key,
+            &transcript_hash,
+            b"server",
+            &client_confirmation,
+        ));
+    }
+
+    #[test]
+    fn wrong_key_confirmation_is_rejected() {
+        let shared_secret = [71u8; 32];
+        let transcript_hash = [72u8; 32];
+
+        let confirmation_key = derive_confirmation_key(&shared_secret);
+        let wrong_key = derive_confirmation_key(&[73u8; 32]);
+
+        let valid_confirmation =
+            create_key_confirmation(&confirmation_key, &transcript_hash, b"server");
+        let wrong_confirmation = create_key_confirmation(&wrong_key, &transcript_hash, b"server");
+
+        assert!(!verify_key_confirmation(
+            &confirmation_key,
+            &transcript_hash,
+            b"server",
+            &wrong_confirmation,
+        ));
+
+        assert!(verify_key_confirmation(
+            &confirmation_key,
+            &transcript_hash,
+            b"server",
+            &valid_confirmation,
+        ));
+    }
 
     #[test]
     fn key_confirmation_is_bound_to_session_transcript_and_role() {
@@ -1024,11 +1115,11 @@ mod tests {
         let bob_secret = [8u8; 32];
 
         let alice = create_ratchet_alice(
-            shared_secret,
+            &shared_secret,
             *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
                 .as_bytes(),
         );
-        let bob = create_ratchet_bob(shared_secret, bob_secret);
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
 
         let alice = Arc::new(Mutex::new(alice));
         let bob = Arc::new(Mutex::new(bob));
@@ -1087,7 +1178,7 @@ mod tests {
             .write_all(&(PACKET_SIZE as u32 - 1).to_be_bytes())
             .unwrap();
 
-        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = create_ratchet_bob(&[7u8; 32], [8u8; 32]);
         let ratchet = Arc::new(Mutex::new(ratchet));
 
         assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
@@ -1111,7 +1202,7 @@ mod tests {
             .unwrap();
         client.write_all(&packet).unwrap();
 
-        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = create_ratchet_bob(&[7u8; 32], [8u8; 32]);
         let ratchet = Arc::new(Mutex::new(ratchet));
 
         assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
@@ -1135,7 +1226,7 @@ mod tests {
             .unwrap();
         client.write_all(&packet).unwrap();
 
-        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = create_ratchet_bob(&[7u8; 32], [8u8; 32]);
         let ratchet = Arc::new(Mutex::new(ratchet));
 
         assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
@@ -1161,7 +1252,7 @@ mod tests {
             .unwrap();
         client.write_all(&packet).unwrap();
 
-        let ratchet = create_ratchet_bob([7u8; 32], [8u8; 32]);
+        let ratchet = create_ratchet_bob(&[7u8; 32], [8u8; 32]);
         let ratchet = Arc::new(Mutex::new(ratchet));
 
         assert!(receive_ratchet_message(&mut server, &ratchet, &session_id).is_err());
@@ -1174,11 +1265,11 @@ mod tests {
         let bob_secret = [8u8; 32];
 
         let alice = create_ratchet_alice(
-            shared_secret,
+            &shared_secret,
             *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
                 .as_bytes(),
         );
-        let bob = create_ratchet_bob(shared_secret, bob_secret);
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
 
         let alice = Arc::new(Mutex::new(alice));
         let bob = Arc::new(Mutex::new(bob));
@@ -1216,17 +1307,305 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_messages_are_accepted() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let alice = Arc::new(Mutex::new(alice));
+        let bob = Arc::new(Mutex::new(bob));
+
+        let mut rng = SystemRng;
+
+        let (header1, ciphertext1) = {
+            let mut ratchet = alice.lock().unwrap();
+            let message = pad_message(b"message one").unwrap();
+            ratchet.ratchet_encrypt(&message, &packet_associated_data(&session_id), &mut rng)
+        };
+
+        let (header2, ciphertext2) = {
+            let mut ratchet = alice.lock().unwrap();
+            let message = pad_message(b"message two").unwrap();
+            ratchet.ratchet_encrypt(&message, &packet_associated_data(&session_id), &mut rng)
+        };
+
+        {
+            let mut ratchet = bob.lock().unwrap();
+
+            let decrypted2 = ratchet
+                .ratchet_decrypt(&header2, &ciphertext2, &packet_associated_data(&session_id))
+                .expect("message two should decrypt out of order");
+
+            assert_eq!(unpad_message(&decrypted2).unwrap(), b"message two");
+
+            let decrypted1 = ratchet
+                .ratchet_decrypt(&header1, &ciphertext1, &packet_associated_data(&session_id))
+                .expect("message one should decrypt from skipped-key storage");
+
+            assert_eq!(unpad_message(&decrypted1).unwrap(), b"message one");
+        }
+    }
+
+    #[test]
+    fn many_out_of_order_messages_are_accepted() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let mut alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let mut bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let mut rng = SystemRng;
+        let mut messages = Vec::new();
+
+        for number in 0u32..1000 {
+            let message = format!("message-{number}");
+            let padded = pad_message(message.as_bytes()).unwrap();
+
+            let (header, ciphertext) =
+                alice.ratchet_encrypt(&padded, &packet_associated_data(&session_id), &mut rng);
+
+            messages.push((number, header, ciphertext.to_vec()));
+        }
+
+        let (number, header, ciphertext) = messages.pop().unwrap();
+
+        let decrypted = bob
+            .ratchet_decrypt(&header, &ciphertext, &packet_associated_data(&session_id))
+            .expect("message 999 should decrypt after a 999-message gap");
+
+        let expected = format!("message-{number}");
+        assert_eq!(unpad_message(&decrypted).unwrap(), expected.as_bytes());
+    }
+
+    #[test]
+    fn excessive_ratchet_skip_is_rejected() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let mut alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let mut bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let mut rng = SystemRng;
+
+        let message0 = pad_message(b"message-0").unwrap();
+        let (header0, ciphertext0) =
+            alice.ratchet_encrypt(&message0, &packet_associated_data(&session_id), &mut rng);
+
+        bob.ratchet_decrypt(&header0, &ciphertext0, &packet_associated_data(&session_id))
+            .unwrap();
+
+        let message1 = pad_message(b"message-1").unwrap();
+        let (header1, ciphertext1) =
+            alice.ratchet_encrypt(&message1, &packet_associated_data(&session_id), &mut rng);
+
+        let mut malicious_header = header1.clone();
+        malicious_header.n = 1002;
+
+        let result = bob.ratchet_decrypt(
+            &malicious_header,
+            &ciphertext1,
+            &packet_associated_data(&session_id),
+        );
+
+        assert!(result.is_err(), "excessive ratchet skip must be rejected");
+
+        let result =
+            bob.ratchet_decrypt(&header1, &ciphertext1, &packet_associated_data(&session_id));
+
+        assert!(
+            result.is_ok(),
+            "ratchet state must remain usable after rejected skip"
+        );
+    }
+
+    #[test]
+    fn bidirectional_dh_ratchet_stress_test() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let mut alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let mut bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let mut rng = SystemRng;
+        let ad = packet_associated_data(&session_id);
+
+        for i in 0..100 {
+            let alice_message = pad_message(format!("alice-{i}").as_bytes()).unwrap();
+            let (header, ciphertext) = alice.ratchet_encrypt(&alice_message, &ad, &mut rng);
+
+            let decrypted = bob.ratchet_decrypt(&header, &ciphertext, &ad).unwrap();
+            assert_eq!(decrypted, alice_message);
+
+            let bob_message = pad_message(format!("bob-{i}").as_bytes()).unwrap();
+            let (header, ciphertext) = bob.ratchet_encrypt(&bob_message, &ad, &mut rng);
+
+            let decrypted = alice.ratchet_decrypt(&header, &ciphertext, &ad).unwrap();
+            assert_eq!(decrypted, bob_message);
+        }
+    }
+
+    #[test]
+    fn skipped_key_storage_full_returns_exact_error() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let mut alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let mut bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let mut rng = SystemRng;
+        let ad = packet_associated_data(&session_id);
+
+        let message0 = pad_message(b"message-0").unwrap();
+        let (header0, ciphertext0) = alice.ratchet_encrypt(&message0, &ad, &mut rng);
+
+        bob.ratchet_decrypt(&header0, &ciphertext0, &ad).unwrap();
+
+        for round in 0..2 {
+            for i in 0..1000 {
+                alice.ratchet_encrypt(
+                    &pad_message(format!("skip-{round}-{i}").as_bytes()).unwrap(),
+                    &ad,
+                    &mut rng,
+                );
+            }
+
+            let message = pad_message(format!("stored-{round}").as_bytes()).unwrap();
+            let (header, ciphertext) = alice.ratchet_encrypt(&message, &ad, &mut rng);
+
+            bob.ratchet_decrypt(&header, &ciphertext, &ad).unwrap();
+        }
+
+        alice.ratchet_encrypt(&pad_message(b"overflow-skip").unwrap(), &ad, &mut rng);
+
+        let message = pad_message(b"storage-full").unwrap();
+        let (header, ciphertext) = alice.ratchet_encrypt(&message, &ad, &mut rng);
+
+        assert_eq!(
+            bob.ratchet_decrypt(&header, &ciphertext, &ad),
+            Err(ksi_double_ratchet::DecryptError::StorageFull)
+        );
+    }
+
+    #[test]
+    fn excessive_ratchet_skip_returns_exact_error() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let mut alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let mut bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let mut rng = SystemRng;
+        let ad = packet_associated_data(&session_id);
+
+        let message0 = pad_message(b"message-0").unwrap();
+        let (header0, ciphertext0) = alice.ratchet_encrypt(&message0, &ad, &mut rng);
+
+        bob.ratchet_decrypt(&header0, &ciphertext0, &ad).unwrap();
+
+        let message1 = pad_message(b"message-1").unwrap();
+        let (header1, ciphertext1) = alice.ratchet_encrypt(&message1, &ad, &mut rng);
+
+        let mut malicious_header = header1.clone();
+        malicious_header.n = 1002;
+
+        let result = bob.ratchet_decrypt(&malicious_header, &ciphertext1, &ad);
+
+        assert_eq!(result, Err(ksi_double_ratchet::DecryptError::SkipTooLarge));
+    }
+
+    #[test]
+    fn invalid_x25519_public_key_is_rejected() {
+        assert!(!ratchet::is_valid_x25519_public_key(&[0u8; 32]));
+    }
+
+    #[test]
+    fn malformed_ratchet_inputs_never_panic() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let mut alice = create_ratchet_alice(
+            &shared_secret,
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
+                .as_bytes(),
+        );
+        let mut bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let mut rng = SystemRng;
+        let ad = packet_associated_data(&session_id);
+
+        let message = pad_message(b"valid-message").unwrap();
+        let (valid_header, valid_ciphertext) = alice.ratchet_encrypt(&message, &ad, &mut rng);
+
+        let mut corrupted_headers = Vec::new();
+
+        for i in 0..32 {
+            let mut header = valid_header.clone();
+            header.n = i * 1000;
+            corrupted_headers.push(header);
+        }
+
+        for mut header in corrupted_headers {
+            header.pn = u32::MAX;
+            let _ = bob.ratchet_decrypt(&header, &valid_ciphertext, &ad);
+        }
+
+        for i in 0..32 {
+            let mut corrupted_ciphertext = valid_ciphertext.clone();
+
+            if !corrupted_ciphertext.is_empty() {
+                let index = i % corrupted_ciphertext.len();
+                corrupted_ciphertext[index] ^= (i as u8).wrapping_add(1);
+            }
+
+            let _ = bob.ratchet_decrypt(&valid_header, &corrupted_ciphertext, &ad);
+        }
+    }
+
+    #[test]
     fn corrupted_ciphertext_is_rejected() {
         let session_id = generate_session_id();
         let shared_secret = [7u8; 32];
         let bob_secret = [8u8; 32];
 
         let alice = create_ratchet_alice(
-            shared_secret,
+            &shared_secret,
             *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
                 .as_bytes(),
         );
-        let bob = create_ratchet_bob(shared_secret, bob_secret);
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
 
         let alice = Arc::new(Mutex::new(alice));
         let bob = Arc::new(Mutex::new(bob));
@@ -1268,11 +1647,11 @@ mod tests {
         let bob_secret = [8u8; 32];
 
         let alice = create_ratchet_alice(
-            shared_secret,
+            &shared_secret,
             *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret))
                 .as_bytes(),
         );
-        let bob = create_ratchet_bob(shared_secret, bob_secret);
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
 
         let alice = Arc::new(Mutex::new(alice));
         let bob = Arc::new(Mutex::new(bob));
@@ -1312,5 +1691,473 @@ mod tests {
         client.write_all(&packet).unwrap();
 
         assert!(receive_ratchet_message(&mut server, &bob, &session_id).is_err());
+
+        let message2 = pad_message(b"after replay").unwrap();
+        let (header2, ciphertext2) = {
+            let mut ratchet = alice.lock().unwrap();
+            ratchet.ratchet_encrypt(&message2, &packet_associated_data(&session_id), &mut rng)
+        };
+
+        packet.clear();
+        packet.extend_from_slice(&[PROTOCOL_VERSION]);
+        packet.extend_from_slice(&[MESSAGE_TYPE_TEXT]);
+        packet.extend_from_slice(&session_id);
+        packet.extend_from_slice(header2.dh.as_ref());
+        packet.extend_from_slice(&header2.n.to_be_bytes());
+        packet.extend_from_slice(&header2.pn.to_be_bytes());
+        packet.extend_from_slice(&ciphertext2);
+
+        client
+            .write_all(&(PACKET_SIZE as u32).to_be_bytes())
+            .unwrap();
+        client.write_all(&packet).unwrap();
+
+        let received2 = receive_ratchet_message(&mut server, &bob, &session_id).unwrap();
+        assert_eq!(received2, b"after replay");
+    }
+    #[test]
+    fn full_handshake_tcp_integration_works() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let server_signing = SigningKey::from_bytes(&[21u8; 32]);
+            let server_identity = server_signing.verifying_key();
+            let challenge = handshake::generate_challenge();
+            send_challenge(&mut stream, &challenge).unwrap();
+
+            let (server_secret, server_x25519) = handshake::generate_keypair();
+            let (_, server_ratchet_x25519) = handshake::generate_keypair();
+            send_public_key(&mut stream, server_x25519.as_bytes()).unwrap();
+            send_identity_key(&mut stream, &server_signing).unwrap();
+            send_public_key(&mut stream, server_ratchet_x25519.as_bytes()).unwrap();
+
+            let client_x25519_bytes = receive_public_key(&mut stream).unwrap();
+            assert!(ratchet::is_valid_x25519_public_key(&client_x25519_bytes));
+            let client_x25519 = x25519_dalek::PublicKey::from(client_x25519_bytes);
+            let client_identity = receive_identity(&mut stream).unwrap();
+
+            let server_signature = handshake::sign_handshake_transcript(
+                &server_signing,
+                &challenge,
+                &server_identity,
+                &client_identity,
+                &server_x25519,
+                &client_x25519,
+                &server_ratchet_x25519,
+            );
+            send_signature(&mut stream, &server_signature).unwrap();
+
+            let client_signature = receive_signature(&mut stream).unwrap();
+            assert!(handshake::verify_handshake_transcript(
+                &client_identity,
+                &client_signature,
+                &challenge,
+                &server_identity,
+                &client_identity,
+                &server_x25519,
+                &client_x25519,
+                &server_ratchet_x25519
+            ));
+
+            let transcript_hash = handshake::handshake_transcript_hash(
+                &challenge,
+                &server_identity,
+                &client_identity,
+                &server_x25519,
+                &client_x25519,
+                &server_ratchet_x25519,
+            );
+            let shared_secret = derive_session_secret(
+                &server_secret,
+                &server_x25519,
+                &client_x25519,
+                &transcript_hash,
+            );
+            let confirmation_key = derive_confirmation_key(&shared_secret);
+            let confirmation =
+                create_key_confirmation(&confirmation_key, &transcript_hash, b"server");
+            send_key_confirmation(&mut stream, &confirmation).unwrap();
+
+            let client_confirmation = receive_key_confirmation(&mut stream).unwrap();
+            assert!(verify_key_confirmation(
+                &confirmation_key,
+                &transcript_hash,
+                b"client",
+                &client_confirmation
+            ));
+
+            derive_session_id(&shared_secret)
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let client_signing = SigningKey::from_bytes(&[22u8; 32]);
+        let client_identity = client_signing.verifying_key();
+
+        let challenge = receive_challenge(&mut stream).unwrap();
+        let (client_secret, client_x25519) = handshake::generate_keypair();
+        let server_x25519_bytes = receive_public_key(&mut stream).unwrap();
+        assert!(ratchet::is_valid_x25519_public_key(&server_x25519_bytes));
+        let server_x25519 = x25519_dalek::PublicKey::from(server_x25519_bytes);
+        let server_identity = receive_identity(&mut stream).unwrap();
+        let server_ratchet_bytes = receive_public_key(&mut stream).unwrap();
+        assert!(ratchet::is_valid_x25519_public_key(&server_ratchet_bytes));
+        let server_ratchet_x25519 = x25519_dalek::PublicKey::from(server_ratchet_bytes);
+
+        send_public_key(&mut stream, client_x25519.as_bytes()).unwrap();
+        send_identity_key(&mut stream, &client_signing).unwrap();
+
+        let server_signature = receive_signature(&mut stream).unwrap();
+        assert!(handshake::verify_handshake_transcript(
+            &server_identity,
+            &server_signature,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519
+        ));
+
+        let client_signature = handshake::sign_handshake_transcript(
+            &client_signing,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+        send_signature(&mut stream, &client_signature).unwrap();
+
+        let transcript_hash = handshake::handshake_transcript_hash(
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+        let shared_secret = derive_session_secret(
+            &client_secret,
+            &client_x25519,
+            &server_x25519,
+            &transcript_hash,
+        );
+        let confirmation_key = derive_confirmation_key(&shared_secret);
+
+        let server_confirmation = receive_key_confirmation(&mut stream).unwrap();
+        assert!(verify_key_confirmation(
+            &confirmation_key,
+            &transcript_hash,
+            b"server",
+            &server_confirmation
+        ));
+
+        let client_confirmation =
+            create_key_confirmation(&confirmation_key, &transcript_hash, b"client");
+        send_key_confirmation(&mut stream, &client_confirmation).unwrap();
+
+        let client_session_id = derive_session_id(&shared_secret);
+        let server_session_id = server_handle.join().unwrap();
+        assert_eq!(client_session_id, server_session_id);
+    }
+    #[test]
+    fn full_handshake_and_ratchet_tcp_integration_works() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+
+            let server_signing = SigningKey::from_bytes(&[31u8; 32]);
+            let server_identity = server_signing.verifying_key();
+            let challenge = handshake::generate_challenge();
+            send_challenge(&mut stream, &challenge).unwrap();
+
+            let (server_secret, server_x25519) = handshake::generate_keypair();
+            let (server_ratchet_secret, server_ratchet_x25519) = handshake::generate_keypair();
+
+            send_public_key(&mut stream, server_x25519.as_bytes()).unwrap();
+            send_identity_key(&mut stream, &server_signing).unwrap();
+            send_public_key(&mut stream, server_ratchet_x25519.as_bytes()).unwrap();
+
+            let client_x25519_bytes = receive_public_key(&mut stream).unwrap();
+            assert!(ratchet::is_valid_x25519_public_key(&client_x25519_bytes));
+            let client_x25519 = x25519_dalek::PublicKey::from(client_x25519_bytes);
+            let client_identity = receive_identity(&mut stream).unwrap();
+
+            let server_signature = handshake::sign_handshake_transcript(
+                &server_signing,
+                &challenge,
+                &server_identity,
+                &client_identity,
+                &server_x25519,
+                &client_x25519,
+                &server_ratchet_x25519,
+            );
+            send_signature(&mut stream, &server_signature).unwrap();
+
+            let client_signature = receive_signature(&mut stream).unwrap();
+            assert!(handshake::verify_handshake_transcript(
+                &client_identity,
+                &client_signature,
+                &challenge,
+                &server_identity,
+                &client_identity,
+                &server_x25519,
+                &client_x25519,
+                &server_ratchet_x25519,
+            ));
+
+            let transcript_hash = handshake::handshake_transcript_hash(
+                &challenge,
+                &server_identity,
+                &client_identity,
+                &server_x25519,
+                &client_x25519,
+                &server_ratchet_x25519,
+            );
+            let shared_secret = derive_session_secret(
+                &server_secret,
+                &server_x25519,
+                &client_x25519,
+                &transcript_hash,
+            );
+            let confirmation_key = derive_confirmation_key(&shared_secret);
+            let server_confirmation =
+                create_key_confirmation(&confirmation_key, &transcript_hash, b"server");
+            send_key_confirmation(&mut stream, &server_confirmation).unwrap();
+
+            let client_confirmation = receive_key_confirmation(&mut stream).unwrap();
+            assert!(verify_key_confirmation(
+                &confirmation_key,
+                &transcript_hash,
+                b"client",
+                &client_confirmation,
+            ));
+
+            let session_id = derive_session_id(&shared_secret);
+            let ratchet = Arc::new(Mutex::new(create_ratchet_bob(
+                &shared_secret,
+                *server_ratchet_secret.as_bytes(),
+            )));
+
+            let message = receive_ratchet_message(&mut stream, &ratchet, &session_id).unwrap();
+            assert_eq!(message, b"ping");
+
+            send_ratchet_message(&mut stream, &ratchet, &session_id, b"pong").unwrap();
+
+            session_id
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let client_signing = SigningKey::from_bytes(&[32u8; 32]);
+        let client_identity = client_signing.verifying_key();
+
+        let challenge = receive_challenge(&mut stream).unwrap();
+        let (client_secret, client_x25519) = handshake::generate_keypair();
+        let server_x25519_bytes = receive_public_key(&mut stream).unwrap();
+        assert!(ratchet::is_valid_x25519_public_key(&server_x25519_bytes));
+        let server_x25519 = x25519_dalek::PublicKey::from(server_x25519_bytes);
+        let server_identity = receive_identity(&mut stream).unwrap();
+        let server_ratchet_bytes = receive_public_key(&mut stream).unwrap();
+        assert!(ratchet::is_valid_x25519_public_key(&server_ratchet_bytes));
+        let server_ratchet_x25519 = x25519_dalek::PublicKey::from(server_ratchet_bytes);
+
+        send_public_key(&mut stream, client_x25519.as_bytes()).unwrap();
+        send_identity_key(&mut stream, &client_signing).unwrap();
+
+        let server_signature = receive_signature(&mut stream).unwrap();
+        assert!(handshake::verify_handshake_transcript(
+            &server_identity,
+            &server_signature,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        ));
+
+        let client_signature = handshake::sign_handshake_transcript(
+            &client_signing,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+        send_signature(&mut stream, &client_signature).unwrap();
+
+        let transcript_hash = handshake::handshake_transcript_hash(
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+        let shared_secret = derive_session_secret(
+            &client_secret,
+            &client_x25519,
+            &server_x25519,
+            &transcript_hash,
+        );
+        let confirmation_key = derive_confirmation_key(&shared_secret);
+
+        let server_confirmation = receive_key_confirmation(&mut stream).unwrap();
+        assert!(verify_key_confirmation(
+            &confirmation_key,
+            &transcript_hash,
+            b"server",
+            &server_confirmation,
+        ));
+
+        let client_confirmation =
+            create_key_confirmation(&confirmation_key, &transcript_hash, b"client");
+        send_key_confirmation(&mut stream, &client_confirmation).unwrap();
+
+        let session_id = derive_session_id(&shared_secret);
+        let ratchet = Arc::new(Mutex::new(create_ratchet_alice(
+            &shared_secret,
+            *server_ratchet_x25519.as_bytes(),
+        )));
+
+        send_ratchet_message(&mut stream, &ratchet, &session_id, b"ping").unwrap();
+        let message = receive_ratchet_message(&mut stream, &ratchet, &session_id).unwrap();
+        assert_eq!(message, b"pong");
+
+        let server_session_id = server_handle.join().unwrap();
+        assert_eq!(session_id, server_session_id);
+    }
+    #[test]
+    fn session_id_changes_when_transcript_changes() {
+        let shared_secret = [91u8; 32];
+        let transcript1 = [92u8; 32];
+        let mut transcript2 = transcript1;
+        transcript2[0] ^= 1;
+
+        let server_secret = x25519_dalek::StaticSecret::from([93u8; 32]);
+        let client_secret = x25519_dalek::StaticSecret::from([94u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret);
+        let client_public = x25519_dalek::PublicKey::from(&client_secret);
+
+        let session_secret1 =
+            derive_session_secret(&server_secret, &server_public, &client_public, &transcript1);
+        let session_secret2 =
+            derive_session_secret(&server_secret, &server_public, &client_public, &transcript2);
+
+        let _ = shared_secret;
+        assert_ne!(session_secret1, session_secret2);
+        assert_ne!(
+            derive_session_id(&session_secret1),
+            derive_session_id(&session_secret2)
+        );
+    }
+
+    #[test]
+    fn reconnect_uses_a_new_session_id() {
+        let server_signing = SigningKey::from_bytes(&[41u8; 32]);
+        let client_signing = SigningKey::from_bytes(&[42u8; 32]);
+        let server_identity = server_signing.verifying_key();
+        let client_identity = client_signing.verifying_key();
+        let (_, server_x25519) = handshake::generate_keypair();
+        let (_, client_x25519) = handshake::generate_keypair();
+        let (_, server_ratchet_x25519) = handshake::generate_keypair();
+
+        let challenge1 = [51u8; handshake::CHALLENGE_SIZE];
+        let challenge2 = [52u8; handshake::CHALLENGE_SIZE];
+
+        let transcript1 = handshake::handshake_transcript_hash(
+            &challenge1,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+        let transcript2 = handshake::handshake_transcript_hash(
+            &challenge2,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+
+        let server_secret = x25519_dalek::StaticSecret::from([53u8; 32]);
+        let client_secret = x25519_dalek::StaticSecret::from([54u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret);
+        let client_public = x25519_dalek::PublicKey::from(&client_secret);
+
+        let session_secret1 =
+            derive_session_secret(&server_secret, &server_public, &client_public, &transcript1);
+        let session_secret2 =
+            derive_session_secret(&server_secret, &server_public, &client_public, &transcript2);
+
+        let session_id1 = derive_session_id(&session_secret1);
+        let session_id2 = derive_session_id(&session_secret2);
+
+        assert_ne!(session_secret1, session_secret2);
+        assert_ne!(session_id1, session_id2);
+    }
+
+    #[test]
+    fn old_handshake_signature_cannot_verify_on_reconnect() {
+        let server_signing = SigningKey::from_bytes(&[61u8; 32]);
+        let client_signing = SigningKey::from_bytes(&[62u8; 32]);
+
+        let server_identity = server_signing.verifying_key();
+        let client_identity = client_signing.verifying_key();
+
+        let server_secret = x25519_dalek::StaticSecret::from([63u8; 32]);
+        let client_secret = x25519_dalek::StaticSecret::from([64u8; 32]);
+
+        let server_x25519 = x25519_dalek::PublicKey::from(&server_secret);
+        let client_x25519 = x25519_dalek::PublicKey::from(&client_secret);
+
+        let server_ratchet_x25519 =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([65u8; 32]));
+
+        let challenge1 = [66u8; handshake::CHALLENGE_SIZE];
+        let mut challenge2 = challenge1;
+        challenge2[0] ^= 1;
+
+        let signature = handshake::sign_handshake_transcript(
+            &server_signing,
+            &challenge1,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+
+        assert!(!handshake::verify_handshake_transcript(
+            &server_identity,
+            &signature,
+            &challenge2,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        ));
     }
 }

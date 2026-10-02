@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core_04::RngCore;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -114,7 +114,7 @@ pub fn verify_handshake_transcript(
         server_ratchet_x25519,
     );
 
-    verifying_key.verify(&message, signature).is_ok()
+    verifying_key.verify_strict(&message, signature).is_ok()
 }
 
 #[cfg(test)]
@@ -165,6 +165,36 @@ mod tests {
 
         assert!(verify_handshake_transcript(
             &server_identity,
+            &signature,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        ));
+    }
+
+    #[test]
+    fn transcript_rejects_wrong_verifying_key() {
+        let (server_signing, client_signing, server_x25519, client_x25519, challenge) = test_keys();
+        let server_ratchet_x25519 = PublicKey::from(&StaticSecret::from([15u8; 32]));
+
+        let server_identity = server_signing.verifying_key();
+        let client_identity = client_signing.verifying_key();
+
+        let signature = sign_handshake_transcript(
+            &server_signing,
+            &challenge,
+            &server_identity,
+            &client_identity,
+            &server_x25519,
+            &client_x25519,
+            &server_ratchet_x25519,
+        );
+
+        assert!(!verify_handshake_transcript(
+            &client_identity,
             &signature,
             &challenge,
             &server_identity,
