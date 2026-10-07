@@ -2,3 +2,7 @@
 
 device.key
 peer.key
+contacts
+contacts.bak
+*.bak
+*.i2p-backup

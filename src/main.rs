@@ -79,6 +79,13 @@ impl RngCore for SystemRng {
 impl CryptoRng for SystemRng {}
 
 fn send_public_key<T: Transport + ?Sized>(stream: &mut T, public_key: &[u8; 32]) -> io::Result<()> {
+    eprintln!(
+        "PUBLIC KEY SEND: sha256={}",
+        Sha256::digest(public_key)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     stream.write_all(public_key)?;
     stream.flush()
 }
@@ -86,6 +93,13 @@ fn send_public_key<T: Transport + ?Sized>(stream: &mut T, public_key: &[u8; 32])
 fn receive_public_key<T: Transport + ?Sized>(stream: &mut T) -> io::Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     stream.read_exact(&mut bytes)?;
+    eprintln!(
+        "PUBLIC KEY RECV: sha256={}",
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     Ok(bytes)
 }
 
@@ -112,6 +126,13 @@ fn send_identity_key<T: Transport + ?Sized>(
     signing_key: &SigningKey,
 ) -> io::Result<()> {
     let verifying_key = signing_key.verifying_key();
+    eprintln!(
+        "IDENTITY SEND: sha256={}",
+        Sha256::digest(verifying_key.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     stream.write_all(verifying_key.as_bytes())?;
     stream.flush()
 }
@@ -124,6 +145,14 @@ fn send_signature<T: Transport + ?Sized>(stream: &mut T, signature: &Signature) 
 fn receive_identity<T: Transport + ?Sized>(stream: &mut T) -> io::Result<VerifyingKey> {
     let mut identity_bytes = [0u8; 32];
     stream.read_exact(&mut identity_bytes)?;
+
+    eprintln!(
+        "IDENTITY RECV: sha256={}",
+        Sha256::digest(&identity_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
 
     VerifyingKey::from_bytes(&identity_bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid identity key"))
@@ -616,13 +645,14 @@ fn create_ratchet_bob(shared_secret: &[u8; 32], my_secret: [u8; 32]) -> Ratchet 
     DoubleRatchet::<CryptoProviderImpl>::new_bob(root, keypair, Some(initial_send))
 }
 
-fn start_server(signing_key: &SigningKey) -> io::Result<()> {
-    let listener = transport::listen("0.0.0.0:9000")?;
+fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) -> io::Result<()> {
+    let listener = transport::listen(bind_address)?;
 
-    println!("Listening on port 9000...");
+    println!("Listening on {bind_address} ({label})...");
     println!("Waiting for connection...");
 
     let (mut stream, address) = listener.accept()?;
+    eprintln!("SERVER ACCEPT DEBUG: {address} ({label})");
 
     println!("Connected to {}", address);
 
@@ -731,10 +761,129 @@ fn start_server(signing_key: &SigningKey) -> io::Result<()> {
     chat(stream, ratchet, session_id)
 }
 
+fn start_server(signing_key: &SigningKey) -> io::Result<()> {
+    start_server_on("0.0.0.0:9000", "TCP", signing_key)
+}
+
+fn start_tor_server(signing_key: &SigningKey) -> io::Result<()> {
+    use arti_client::{TorClient, TorClientConfig};
+    use safelog::DisplayRedacted;
+    use std::sync::mpsc;
+    use tokio::runtime::Runtime;
+    use tor_hsrproxy::OnionServiceReverseProxy;
+    use tor_hsrproxy::config::{
+        Encapsulation, ProxyAction, ProxyConfigBuilder, ProxyPattern, ProxyRule, TargetAddr,
+    };
+    use tor_hsservice::HsNickname;
+    use tor_hsservice::config::OnionServiceConfigBuilder;
+    use tor_rtcompat::SpawnExt;
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let result = (|| -> io::Result<()> {
+            let runtime =
+                Runtime::new().map_err(|e| io::Error::other(format!("Tokio runtime: {e}")))?;
+
+            let tx_ready = tx.clone();
+
+            runtime.block_on(async move {
+                let client = TorClient::create_bootstrapped(TorClientConfig::default())
+                    .await
+                    .map_err(|e| io::Error::other(format!("Arti bootstrap: {e}")))?;
+
+                let nickname = HsNickname::new("private-messenger".to_string())
+                    .map_err(|e| io::Error::other(format!("Onion nickname: {e}")))?;
+
+                let config = OnionServiceConfigBuilder::default()
+                    .nickname(nickname.clone())
+                    .build()
+                    .map_err(|e| io::Error::other(format!("Onion config: {e}")))?;
+
+                let Some((running, requests)) = client
+                    .launch_onion_service(config)
+                    .map_err(|e| io::Error::other(format!("Onion service: {e}")))?
+                else {
+                    return Err(io::Error::other("Onion service disabled"));
+                };
+
+                let rule = ProxyRule::new(
+                    ProxyPattern::one_port(9000)
+                        .map_err(|e| io::Error::other(format!("Proxy port: {e}")))?,
+                    ProxyAction::Forward(
+                        Encapsulation::Simple,
+                        TargetAddr::Inet(
+                            "127.0.0.1:9000"
+                                .parse()
+                                .map_err(|e| io::Error::other(format!("Proxy target: {e}")))?,
+                        ),
+                    ),
+                );
+
+                let mut proxy_config = ProxyConfigBuilder::default();
+                proxy_config.set_proxy_ports(vec![rule]);
+
+                let proxy = OnionServiceReverseProxy::new(
+                    proxy_config
+                        .build()
+                        .map_err(|e| io::Error::other(format!("Proxy config: {e}")))?,
+                );
+                let runtime_handle = client.runtime().clone();
+                let proxy_clone = proxy.clone();
+
+                client
+                    .runtime()
+                    .spawn(async move {
+                        if let Err(e) = proxy_clone
+                            .handle_requests(runtime_handle, nickname, requests)
+                            .await
+                        {
+                            eprintln!("Tor proxy error: {e}");
+                        }
+                    })
+                    .map_err(|e| io::Error::other(format!("Tor proxy spawn: {e}")))?;
+
+                let address = running
+                    .onion_address()
+                    .ok_or_else(|| io::Error::other("Onion address unavailable"))?
+                    .display_unredacted()
+                    .to_string();
+
+                tx_ready
+                    .send(Ok(address))
+                    .map_err(|_| io::Error::other("Main thread closed"))?;
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        })();
+
+        if let Err(e) = result {
+            let _ = tx.send(Err(e));
+        }
+    });
+
+    let onion_address = rx
+        .recv()
+        .map_err(|_| io::Error::other("Tor thread stopped"))??;
+
+    println!("Tor onion service: {onion_address}");
+    println!("Forwarding onion port 9000 -> 127.0.0.1:9000");
+
+    start_server_on("127.0.0.1:9000", "Tor", signing_key)
+}
+
 fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
     println!("Connecting to {}...", address);
 
-    let mut stream = transport::connect(address)?;
+    let mut stream = if let Some(i2p_address) = address.strip_prefix("i2p://") {
+        println!("Routing connection through I2P...");
+        transport::connect_i2p(i2p_address)?
+    } else if let Some(tor_address) = address.strip_prefix("tor://") {
+        println!("Routing connection through Tor...");
+        transport::connect_tor(tor_address)?
+    } else {
+        transport::connect(address)?
+    };
 
     stream.set_handshake_timeouts()?;
 
@@ -863,6 +1012,66 @@ fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
     chat(stream, ratchet, session_id)
 }
 
+fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
+    use std::sync::mpsc;
+    use tokio::runtime::Runtime;
+    use yosemite::{Session as I2pSession, style::Stream as I2pStream};
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let runtime = match Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = tx.send(Err(io::Error::other(format!("Tokio runtime: {error}"))));
+                return;
+            }
+        };
+
+        let tx_ready = tx.clone();
+        let result = runtime.block_on(async move {
+            let mut session = I2pSession::<I2pStream>::new(Default::default())
+                .await
+                .map_err(|error| io::Error::other(format!("I2P session: {error}")))?;
+
+            let destination = session.destination().to_string();
+            eprintln!(
+                "I2P DEST DEBUG: len={} sha256={}",
+                destination.len(),
+                Sha256::digest(destination.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            );
+
+            tx_ready
+                .send(Ok(destination))
+                .map_err(|_| io::Error::other("Main thread closed"))?;
+
+            session
+                .forward(9000)
+                .await
+                .map_err(|error| io::Error::other(format!("I2P forward: {error}")))?;
+
+            std::future::pending::<()>().await;
+            Ok::<(), io::Error>(())
+        });
+
+        if let Err(error) = result {
+            let _ = tx.send(Err(error));
+        }
+    });
+
+    let destination = rx
+        .recv()
+        .map_err(|_| io::Error::other("I2P thread stopped"))??;
+
+    println!("I2P destination: {destination}");
+    println!("Forwarding I2P -> 127.0.0.1:9000");
+
+    start_server_on("127.0.0.1:9000", "I2P", signing_key)
+}
+
 fn unlock_device() -> io::Result<SigningKey> {
     let data = fs::read("device.key")?;
 
@@ -916,6 +1125,55 @@ fn unlock_device() -> io::Result<SigningKey> {
     Ok(signing_key)
 }
 
+fn change_device_password(signing_key: &SigningKey) -> io::Result<()> {
+    let new_password = Zeroizing::new(
+        prompt_password("New device password: ")
+            .map_err(|e| io::Error::other(format!("Could not read password: {e}")))?,
+    );
+    let confirm = Zeroizing::new(
+        prompt_password("Confirm new device password: ")
+            .map_err(|e| io::Error::other(format!("Could not read password: {e}")))?,
+    );
+    if new_password.as_bytes() != confirm.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "New passwords do not match",
+        ));
+    }
+    if new_password.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "New password cannot be empty",
+        ));
+    }
+
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut salt).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    getrandom::fill(&mut nonce_bytes).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+
+    let mut encryption_key = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(new_password.as_bytes(), &salt, &mut *encryption_key)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key derivation failed"))?;
+
+    let cipher = ChaCha20Poly1305::new(&Key::from(*encryption_key));
+    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let encrypted_key = cipher
+        .encrypt(&nonce, signing_key.to_bytes().as_ref())
+        .map_err(|_| io::Error::other("Failed to encrypt device key"))?;
+
+    let mut data = Vec::with_capacity(16 + 12 + encrypted_key.len());
+    data.extend_from_slice(&salt);
+    data.extend_from_slice(&nonce_bytes);
+    data.extend_from_slice(&encrypted_key);
+
+    fs::write("device.key.tmp", &data)?;
+    fs::rename("device.key.tmp", "device.key")?;
+    println!("Device password changed successfully.");
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     println!("Private Messenger");
 
@@ -923,14 +1181,21 @@ fn main() -> io::Result<()> {
 
     println!();
     println!("Network");
+    println!("0 = change device password");
     println!("1 = server");
     println!("2 = client");
+    println!("3 = Tor server");
+    println!("4 = I2P server");
 
     let mut input = String::new();
 
     io::stdin().read_line(&mut input)?;
 
     match input.trim() {
+        "0" => {
+            change_device_password(&signing_key)?;
+        }
+
         "1" => {
             start_server(&signing_key)?;
         }
@@ -943,6 +1208,14 @@ fn main() -> io::Result<()> {
             io::stdin().read_line(&mut input)?;
 
             start_client(input.trim(), &signing_key)?;
+        }
+
+        "3" => {
+            start_tor_server(&signing_key)?;
+        }
+
+        "4" => {
+            start_i2p_server(&signing_key)?;
         }
 
         _ => {
