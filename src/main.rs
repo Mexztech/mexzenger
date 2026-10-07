@@ -645,15 +645,11 @@ fn create_ratchet_bob(shared_secret: &[u8; 32], my_secret: [u8; 32]) -> Ratchet 
     DoubleRatchet::<CryptoProviderImpl>::new_bob(root, keypair, Some(initial_send))
 }
 
-fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) -> io::Result<()> {
-    let listener = transport::listen(bind_address)?;
-
-    println!("Listening on {bind_address} ({label})...");
-    println!("Waiting for connection...");
-
-    let (mut stream, address) = listener.accept()?;
-    eprintln!("SERVER ACCEPT DEBUG: {address} ({label})");
-
+fn serve_connection(
+    mut stream: Box<dyn Transport>,
+    address: &str,
+    signing_key: &SigningKey,
+) -> io::Result<()> {
     println!("Connected to {}", address);
 
     stream.set_handshake_timeouts()?;
@@ -680,7 +676,7 @@ fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) ->
     let remote_identity = receive_identity(&mut stream)?;
 
     if !verify_or_pin_identity(&remote_identity) {
-        return Ok(());
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Identity not trusted"));
     }
 
     let server_identity = signing_key.verifying_key();
@@ -759,6 +755,30 @@ fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) ->
     let ratchet = create_ratchet_bob(&shared_secret, *ratchet_secret.as_bytes());
 
     chat(stream, ratchet, session_id)
+}
+
+fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) -> io::Result<()> {
+    let listener = transport::listen(bind_address)?;
+
+    println!("Listening on {bind_address} ({label})...");
+
+    loop {
+        println!("Waiting for connection...");
+
+        let (stream, address) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("Accept failed: {error}");
+                thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        match serve_connection(stream, &address, signing_key) {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!("Connection failed: {error}"),
+        }
+    }
 }
 
 fn start_server(signing_key: &SigningKey) -> io::Result<()> {
