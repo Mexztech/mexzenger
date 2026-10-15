@@ -1,15 +1,25 @@
+use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use yosemite::{style::Stream, Session, SessionOptions};
+use yosemite::{Session, SessionOptions, style::Stream};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Session::<Stream>::new(SessionOptions {
         silent_forward: true,
         ..Default::default()
-    }).await?;
+    })
+    .await?;
 
     let destination = server.destination().to_owned();
+    println!(
+        "I2P DEST DEBUG: len={} sha256={}",
+        destination.len(),
+        sha2::Sha256::digest(destination.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
 
     tokio::spawn(async move {
         let listener = TcpListener::bind("127.0.0.1:9100").await.unwrap();
@@ -45,7 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 expected: {:?}
 actual:   {:?}",
             data, response
-        ).into());
+        )
+        .into());
     }
 
     println!("I2P FORWARD END TO END SUCCESS");

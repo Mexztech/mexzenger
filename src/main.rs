@@ -95,7 +95,7 @@ fn receive_public_key<T: Transport + ?Sized>(stream: &mut T) -> io::Result<[u8; 
     stream.read_exact(&mut bytes)?;
     eprintln!(
         "PUBLIC KEY RECV: sha256={}",
-        Sha256::digest(&bytes)
+        Sha256::digest(bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
@@ -148,7 +148,7 @@ fn receive_identity<T: Transport + ?Sized>(stream: &mut T) -> io::Result<Verifyi
 
     eprintln!(
         "IDENTITY RECV: sha256={}",
-        Sha256::digest(&identity_bytes)
+        Sha256::digest(identity_bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
@@ -676,7 +676,10 @@ fn serve_connection(
     let remote_identity = receive_identity(&mut stream)?;
 
     if !verify_or_pin_identity(&remote_identity) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Identity not trusted"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Identity not trusted",
+        ));
     }
 
     let server_identity = signing_key.verifying_key();
@@ -1178,7 +1181,8 @@ fn change_device_password(signing_key: &SigningKey) -> io::Result<()> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key derivation failed"))?;
 
     let cipher = ChaCha20Poly1305::new(&Key::from(*encryption_key));
-    let nonce = Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let nonce =
+        Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
     let encrypted_key = cipher
         .encrypt(&nonce, signing_key.to_bytes().as_ref())
         .map_err(|_| io::Error::other("Failed to encrypt device key"))?;

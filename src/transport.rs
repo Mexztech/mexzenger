@@ -225,7 +225,7 @@ struct TorTransport {
 }
 
 impl TorTransport {
-    fn new(address: &str) -> io::Result<Box<dyn Transport>> {
+    fn connect(address: &str) -> io::Result<Box<dyn Transport>> {
         let runtime = Arc::new(
             Runtime::new().map_err(|error| io::Error::other(format!("Tokio runtime: {error}")))?,
         );
@@ -329,5 +329,5 @@ impl Write for TorTransport {
 }
 
 pub fn connect_tor(address: &str) -> io::Result<Box<dyn Transport>> {
-    TorTransport::new(address)
+    TorTransport::connect(address)
 }

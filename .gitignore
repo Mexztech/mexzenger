@@ -6,3 +6,7 @@ contacts
 contacts.bak
 *.bak
 *.i2p-backup
+
+# Local notes and scratch files
+messenger_context.txt
+nano
