@@ -309,6 +309,210 @@ fn add_trusted_fingerprint(path: &str, fingerprint: &str) -> io::Result<()> {
     fingerprints.push(fingerprint.to_string());
     encrypt_contacts_file(path, &fingerprints)
 }
+const HISTORY_MAGIC: &[u8; 4] = b"PMH1";
+const HISTORY_FILE: &str = "history";
+const HISTORY_KEY_INFO: &[u8] = b"history-file-key";
+const FINGERPRINT_LEN: usize = 47;
+
+#[derive(Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    timestamp: u64,
+    outgoing: bool,
+    peer: String,
+    message: Vec<u8>,
+}
+
+struct HistoryLogger {
+    path: String,
+}
+
+impl HistoryLogger {
+    fn new(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+        }
+    }
+
+    fn log(&mut self, peer: &str, outgoing: bool, message: &[u8]) -> io::Result<()> {
+        history_append(&self.path, peer, outgoing, message)
+    }
+}
+
+fn history_cipher(salt: &[u8]) -> io::Result<ChaCha20Poly1305> {
+    let master = CONTACTS_MASTER_KEY
+        .lock()
+        .map_err(|_| io::Error::other("History key mutex poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("History key not initialized"))?;
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), &*master);
+    let mut file_key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(HISTORY_KEY_INFO, &mut *file_key)
+        .expect("HKDF expansion failed");
+    Ok(ChaCha20Poly1305::new(&Key::from(*file_key)))
+}
+
+fn history_append(path: &str, peer: &str, outgoing: bool, message: &[u8]) -> io::Result<()> {
+    if peer.len() != FINGERPRINT_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid peer fingerprint length",
+        ));
+    }
+    if !Path::new(path).exists() {
+        let mut salt = [0u8; 16];
+        getrandom::fill(&mut salt).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+        let mut header = Vec::with_capacity(20);
+        header.extend_from_slice(HISTORY_MAGIC);
+        header.extend_from_slice(&salt);
+        fs::write(path, &header)?;
+    }
+    let header = fs::read(path)?;
+    if header.len() < 20 || !header.starts_with(HISTORY_MAGIC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid history file",
+        ));
+    }
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&header[4..20]);
+    let cipher = history_cipher(&salt)?;
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut nonce_bytes).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    let nonce =
+        Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| io::Error::other(format!("System clock error: {e}")))?
+        .as_secs();
+    let mut record = Vec::with_capacity(8 + 1 + FINGERPRINT_LEN + 4 + message.len());
+    record.extend_from_slice(&timestamp.to_be_bytes());
+    record.push(u8::from(outgoing));
+    record.extend_from_slice(peer.as_bytes());
+    record.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    record.extend_from_slice(message);
+    let ciphertext = cipher
+        .encrypt(&nonce, record.as_slice())
+        .map_err(|_| io::Error::other("Failed to encrypt history record"))?;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    file.write_all(&(ciphertext.len() as u32).to_be_bytes())?;
+    file.write_all(&nonce_bytes)?;
+    file.write_all(&ciphertext)?;
+    Ok(())
+}
+
+fn history_read(path: &str) -> io::Result<Vec<HistoryEntry>> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read(path)?;
+    if data.len() < 20 || !data.starts_with(HISTORY_MAGIC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid history file",
+        ));
+    }
+    let mut salt = [0u8; 16];
+    salt.copy_from_slice(&data[4..20]);
+    let cipher = history_cipher(&salt)?;
+    let mut entries = Vec::new();
+    let mut position = 20;
+    while position < data.len() {
+        if position + 4 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated history record",
+            ));
+        }
+        let length = u32::from_be_bytes(data[position..position + 4].try_into().unwrap()) as usize;
+        position += 4;
+        if position + 12 + length > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated history record",
+            ));
+        }
+        let nonce = Nonce::try_from(&data[position..position + 12])
+            .map_err(|_| io::Error::other("Invalid nonce"))?;
+        let ciphertext = &data[position + 12..position + 12 + length];
+        position += 12 + length;
+        let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Could not decrypt history record (wrong password or corrupted file)",
+            )
+        })?;
+        if plaintext.len() < 8 + 1 + FINGERPRINT_LEN + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid history record",
+            ));
+        }
+        let timestamp = u64::from_be_bytes(plaintext[0..8].try_into().unwrap());
+        let outgoing = plaintext[8] != 0;
+        let peer = String::from_utf8_lossy(&plaintext[9..9 + FINGERPRINT_LEN]).to_string();
+        let message_length = u32::from_be_bytes(
+            plaintext[9 + FINGERPRINT_LEN..9 + FINGERPRINT_LEN + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        if plaintext.len() != 9 + FINGERPRINT_LEN + 4 + message_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid history record length",
+            ));
+        }
+        let message = plaintext[9 + FINGERPRINT_LEN + 4..].to_vec();
+        entries.push(HistoryEntry {
+            timestamp,
+            outgoing,
+            peer,
+            message,
+        });
+    }
+    Ok(entries)
+}
+
+fn format_unix_time(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let seconds_of_day = secs % 86400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (year + i64::from(month <= 2), month, day)
+}
+
+fn show_history() {
+    match history_read(HISTORY_FILE) {
+        Ok(entries) if entries.is_empty() => println!("No history"),
+        Ok(entries) => {
+            for entry in entries {
+                let direction = if entry.outgoing { "sent" } else { "recv" };
+                println!(
+                    "{} {:4} {} {}",
+                    format_unix_time(entry.timestamp),
+                    direction,
+                    entry.peer,
+                    String::from_utf8_lossy(&entry.message)
+                );
+            }
+        }
+        Err(error) => println!("Could not read history: {}", error),
+    }
+}
 fn is_trusted(fingerprints: &[String], current: &str) -> bool {
     fingerprints.iter().any(|trusted| trusted == current)
 }
@@ -2884,6 +3088,42 @@ cc:dd
         );
     }
 
+    #[test]
+    fn history_round_trip_and_tamper_detection() {
+        let _ = set_contacts_key(b"history-test-password");
+
+        let path = "test_history_roundtrip.bin";
+        let _ = fs::remove_file(path);
+        let peer = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+
+        history_append(path, peer, true, b"hello").unwrap();
+        history_append(path, peer, false, b"").unwrap();
+        history_append(path, peer, true, b"third message").unwrap();
+
+        let entries = history_read(path).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].peer, peer);
+        assert!(entries[0].outgoing);
+        assert_eq!(entries[0].message, b"hello");
+        assert!(!entries[1].outgoing);
+        assert!(entries[1].message.is_empty());
+        assert_eq!(entries[2].message, b"third message");
+
+        let mut data = fs::read(path).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 1;
+        fs::write(path, &data).unwrap();
+        assert!(history_read(path).is_err());
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn unix_time_formatting_is_sane() {
+        assert_eq!(format_unix_time(0), "1970-01-01 00:00:00");
+        assert_eq!(format_unix_time(86400), "1970-01-02 00:00:00");
+        assert_eq!(format_unix_time(1767225600), "2026-01-01 00:00:00");
+    }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
         let server_signing = SigningKey::from_bytes(&[61u8; 32]);
