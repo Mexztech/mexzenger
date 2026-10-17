@@ -14,7 +14,7 @@ use ksi_double_ratchet::{DoubleRatchet, Header};
 use rand_core_04::{CryptoRng, Error as RandError, RngCore};
 use rpassword::prompt_password;
 use sha2::{Digest, Sha256};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,38 +206,109 @@ fn fingerprint(key: &VerifyingKey) -> String {
         .join(":")
 }
 
-fn load_trusted_fingerprints(path: &str) -> io::Result<Vec<String>> {
-    if !Path::new(path).exists() {
-        return Ok(Vec::new());
+const CONTACTS_MAGIC: &[u8; 4] = b"PMC1";
+const CONTACTS_KEY_SALT: &[u8] = b"private-messenger-contacts-v1";
+static CONTACTS_MASTER_KEY: Mutex<Option<Zeroizing<[u8; 32]>>> = Mutex::new(None);
+fn set_contacts_key(password: &[u8]) -> io::Result<()> {
+    let mut master = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(password, CONTACTS_KEY_SALT, &mut *master)
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Contacts key derivation failed")
+        })?;
+    let mut slot = CONTACTS_MASTER_KEY
+        .lock()
+        .map_err(|_| io::Error::other("Contacts key mutex poisoned"))?;
+    *slot = Some(master);
+    Ok(())
+}
+fn contacts_cipher(salt: &[u8]) -> io::Result<ChaCha20Poly1305> {
+    let master = CONTACTS_MASTER_KEY
+        .lock()
+        .map_err(|_| io::Error::other("Contacts key mutex poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("Contacts key not initialized"))?;
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), &*master);
+    let mut file_key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"contacts-file-key", &mut *file_key)
+        .expect("HKDF expansion failed");
+    Ok(ChaCha20Poly1305::new(&Key::from(*file_key)))
+}
+fn encrypt_contacts_file(path: &str, fingerprints: &[String]) -> io::Result<()> {
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut salt).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    getrandom::fill(&mut nonce_bytes).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    let cipher = contacts_cipher(&salt)?;
+    let nonce =
+        Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let mut plaintext = String::new();
+    for fingerprint in fingerprints {
+        plaintext.push_str(fingerprint);
+        plaintext.push('\n');
     }
-
-    let contents = fs::read_to_string(path)?;
-
-    Ok(contents
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext.as_bytes())
+        .map_err(|_| io::Error::other("Failed to encrypt contacts"))?;
+    let mut data = Vec::with_capacity(4 + 16 + 12 + ciphertext.len());
+    data.extend_from_slice(CONTACTS_MAGIC);
+    data.extend_from_slice(&salt);
+    data.extend_from_slice(&nonce_bytes);
+    data.extend_from_slice(&ciphertext);
+    let tmp_path = format!("{path}.tmp");
+    fs::write(&tmp_path, &data)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+fn decrypt_contacts_file(data: &[u8]) -> io::Result<Vec<String>> {
+    if data.len() < 4 + 16 + 12 + 16 || !data.starts_with(CONTACTS_MAGIC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid contacts file",
+        ));
+    }
+    let salt = &data[4..20];
+    let nonce_bytes = &data[20..32];
+    let ciphertext = &data[32..];
+    let cipher = contacts_cipher(salt)?;
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Could not decrypt contacts (wrong password or corrupted file)",
+        )
+    })?;
+    let text = String::from_utf8_lossy(&plaintext);
+    Ok(text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
 }
-
+fn load_trusted_fingerprints(path: &str) -> io::Result<Vec<String>> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read(path)?;
+    if data.starts_with(CONTACTS_MAGIC) {
+        return decrypt_contacts_file(&data);
+    }
+    let text = String::from_utf8_lossy(&data);
+    let fingerprints: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    encrypt_contacts_file(path, &fingerprints)?;
+    Ok(fingerprints)
+}
 fn add_trusted_fingerprint(path: &str, fingerprint: &str) -> io::Result<()> {
     let mut fingerprints = load_trusted_fingerprints(path)?;
     fingerprints.push(fingerprint.to_string());
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-
-    for entry in &fingerprints {
-        writeln!(file, "{}", entry)?;
-    }
-
-    Ok(())
+    encrypt_contacts_file(path, &fingerprints)
 }
-
 fn is_trusted(fingerprints: &[String], current: &str) -> bool {
     fingerprints.iter().any(|trusted| trusted == current)
 }
@@ -1333,6 +1404,8 @@ fn create_device() -> io::Result<SigningKey> {
     getrandom::fill(&mut *secret).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
     let signing_key = SigningKey::from_bytes(&secret);
     encrypt_and_store_device_key("device.key", &signing_key, password.as_bytes())?;
+
+    set_contacts_key(password.as_bytes())?;
     println!("New device created");
     println!(
         "Identity fingerprint: {}",
@@ -1391,6 +1464,8 @@ fn unlock_device() -> io::Result<SigningKey> {
 
     let signing_key = SigningKey::from_bytes(&private_key);
 
+    set_contacts_key(password.as_bytes())?;
+
     let verifying_key = signing_key.verifying_key();
 
     println!("Device unlocked");
@@ -1422,6 +1497,13 @@ fn change_device_password(signing_key: &SigningKey) -> io::Result<()> {
     }
 
     encrypt_and_store_device_key("device.key", signing_key, new_password.as_bytes())?;
+
+    let fingerprints = load_trusted_fingerprints(CONTACTS_FILE)?;
+    set_contacts_key(new_password.as_bytes())?;
+    if !fingerprints.is_empty() {
+        encrypt_contacts_file(CONTACTS_FILE, &fingerprints)?;
+    }
+
     println!("Device password changed successfully.");
     Ok(())
 }
@@ -2695,6 +2777,35 @@ mod tests {
         assert!(is_trusted(&stored, &first));
         assert!(is_trusted(&stored, &second));
         assert!(!is_trusted(&stored, "ee:ff"));
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn contacts_file_round_trip_and_legacy_migration() {
+        let _ = set_contacts_key(b"contacts-test-password");
+
+        let path = "test_contacts_encrypted.bin";
+        let _ = fs::remove_file(path);
+
+        fs::write(
+            path,
+            "aa:bb
+cc:dd
+",
+        )
+        .unwrap();
+
+        let loaded = load_trusted_fingerprints(path).unwrap();
+        assert_eq!(loaded, vec!["aa:bb".to_string(), "cc:dd".to_string()]);
+
+        let data = fs::read(path).unwrap();
+        assert!(data.starts_with(b"PMC1"));
+
+        add_trusted_fingerprint(path, "ee:ff").unwrap();
+        let loaded = load_trusted_fingerprints(path).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert!(is_trusted(&loaded, "ee:ff"));
 
         fs::remove_file(path).ok();
     }
