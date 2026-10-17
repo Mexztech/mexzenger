@@ -2761,6 +2761,8 @@ mod tests {
 
     #[test]
     fn multiple_contacts_are_stored_and_matched() {
+        let _ = set_contacts_key(b"contacts-test-password");
+
         let path = "test_contacts_store.txt";
         let _ = fs::remove_file(path);
 
