@@ -11,11 +11,12 @@ use yosemite::{ReadHalf as I2pReadHalf, WriteHalf as I2pWriteHalf};
 pub trait Transport: Read + Write + Send {
     fn try_clone_transport(&self) -> io::Result<Box<dyn Transport>>;
 
-    fn clear_timeouts(&self) -> io::Result<()> {
+    fn set_handshake_timeouts(&self) -> io::Result<()> {
         Ok(())
     }
 
-    fn set_handshake_timeouts(&self) -> io::Result<()> {
+    fn set_read_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
+        let _ = duration;
         Ok(())
     }
 }
@@ -29,12 +30,12 @@ impl Transport for Box<dyn Transport> {
         (**self).try_clone_transport()
     }
 
-    fn clear_timeouts(&self) -> io::Result<()> {
-        (**self).clear_timeouts()
-    }
-
     fn set_handshake_timeouts(&self) -> io::Result<()> {
         (**self).set_handshake_timeouts()
+    }
+
+    fn set_read_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
+        (**self).set_read_timeout(duration)
     }
 }
 
@@ -43,16 +44,14 @@ impl Transport for TcpStream {
         Ok(Box::new(self.try_clone()?))
     }
 
-    fn clear_timeouts(&self) -> io::Result<()> {
-        self.set_read_timeout(None)?;
-        self.set_write_timeout(None)?;
-        Ok(())
-    }
-
     fn set_handshake_timeouts(&self) -> io::Result<()> {
         self.set_read_timeout(Some(Duration::from_secs(30)))?;
         self.set_write_timeout(Some(Duration::from_secs(30)))?;
         Ok(())
+    }
+
+    fn set_read_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, duration)
     }
 }
 
@@ -158,16 +157,6 @@ impl Transport for I2pTransport {
         Ok(Box::new(self.clone()))
     }
 
-    fn clear_timeouts(&self) -> io::Result<()> {
-        let mut timeout = self
-            .inner
-            .timeout
-            .lock()
-            .map_err(|_| io::Error::other("I2P timeout mutex poisoned"))?;
-        *timeout = None;
-        Ok(())
-    }
-
     fn set_handshake_timeouts(&self) -> io::Result<()> {
         let mut timeout = self
             .inner
@@ -175,6 +164,16 @@ impl Transport for I2pTransport {
             .lock()
             .map_err(|_| io::Error::other("I2P timeout mutex poisoned"))?;
         *timeout = Some(Duration::from_secs(30));
+        Ok(())
+    }
+
+    fn set_read_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
+        let mut timeout = self
+            .inner
+            .timeout
+            .lock()
+            .map_err(|_| io::Error::other("I2P timeout mutex poisoned"))?;
+        *timeout = duration;
         Ok(())
     }
 }
@@ -278,16 +277,6 @@ impl Transport for TorTransport {
         Ok(Box::new(self.clone()))
     }
 
-    fn clear_timeouts(&self) -> io::Result<()> {
-        let mut timeout = self
-            .inner
-            .timeout
-            .lock()
-            .map_err(|_| io::Error::other("Tor timeout mutex poisoned"))?;
-        *timeout = None;
-        Ok(())
-    }
-
     fn set_handshake_timeouts(&self) -> io::Result<()> {
         let mut timeout = self
             .inner
@@ -295,6 +284,16 @@ impl Transport for TorTransport {
             .lock()
             .map_err(|_| io::Error::other("Tor timeout mutex poisoned"))?;
         *timeout = Some(Duration::from_secs(30));
+        Ok(())
+    }
+
+    fn set_read_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
+        let mut timeout = self
+            .inner
+            .timeout
+            .lock()
+            .map_err(|_| io::Error::other("Tor timeout mutex poisoned"))?;
+        *timeout = duration;
         Ok(())
     }
 }

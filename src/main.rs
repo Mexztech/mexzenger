@@ -17,8 +17,10 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use transport::Transport;
 use zeroize::Zeroizing;
 
@@ -28,17 +30,26 @@ use ratchet::{
 };
 
 const CONTACTS_FILE: &str = "contacts";
+#[cfg(test)]
 fn packet_associated_data(session_id: &[u8; 16]) -> Vec<u8> {
+    packet_associated_data_for_type(session_id, MESSAGE_TYPE_TEXT)
+}
+
+fn packet_associated_data_for_type(session_id: &[u8; 16], message_type: u8) -> Vec<u8> {
     let mut data = Vec::with_capacity(18);
     data.push(PROTOCOL_VERSION);
-    data.push(MESSAGE_TYPE_TEXT);
+    data.push(message_type);
     data.extend_from_slice(session_id);
     data
 }
 
 const PACKET_SIZE: usize = 4096;
-const PROTOCOL_VERSION: u8 = 1;
+const PROTOCOL_VERSION: u8 = 2;
 const MESSAGE_TYPE_TEXT: u8 = 1;
+const MESSAGE_TYPE_PING: u8 = 2;
+const MESSAGE_TYPE_PONG: u8 = 3;
+const KEEPALIVE_SILENCE_SECS: u64 = 60;
+const KEEPALIVE_PONG_WAIT_SECS: u64 = 30;
 #[cfg(test)]
 fn generate_session_id() -> [u8; 16] {
     let mut id = [0u8; 16];
@@ -332,6 +343,16 @@ fn send_ratchet_message<T: Transport + ?Sized>(
     session_id: &[u8; 16],
     message: &[u8],
 ) -> io::Result<()> {
+    send_ratchet_packet(stream, ratchet, session_id, MESSAGE_TYPE_TEXT, message)
+}
+
+fn send_ratchet_packet<T: Transport + ?Sized>(
+    stream: &mut T,
+    ratchet: &Arc<Mutex<Ratchet>>,
+    session_id: &[u8; 16],
+    message_type: u8,
+    message: &[u8],
+) -> io::Result<()> {
     let mut rng = SystemRng;
 
     let mut ratchet = ratchet
@@ -339,14 +360,14 @@ fn send_ratchet_message<T: Transport + ?Sized>(
         .map_err(|_| io::Error::other("Ratchet mutex poisoned"))?;
 
     let padded_message = pad_message(message)?;
-    let associated_data = packet_associated_data(session_id);
+    let associated_data = packet_associated_data_for_type(session_id, message_type);
 
     let (header, ciphertext) = ratchet.ratchet_encrypt(&padded_message, &associated_data, &mut rng);
 
     let mut packet = Vec::with_capacity(PACKET_SIZE);
 
     packet.extend_from_slice(&[PROTOCOL_VERSION]);
-    packet.extend_from_slice(&[MESSAGE_TYPE_TEXT]);
+    packet.extend_from_slice(&[message_type]);
     packet.extend_from_slice(session_id);
     packet.extend_from_slice(header.dh.as_ref());
     packet.extend_from_slice(&header.n.to_be_bytes());
@@ -393,11 +414,12 @@ fn unpad_message(padded: &[u8]) -> io::Result<Vec<u8>> {
     Ok(padded[4..4 + message_len].to_vec())
 }
 
-fn receive_ratchet_message<T: Transport + ?Sized>(
+fn receive_ratchet_packet<T: Transport + ?Sized>(
     stream: &mut T,
     ratchet: &Arc<Mutex<Ratchet>>,
     session_id: &[u8; 16],
-) -> io::Result<Vec<u8>> {
+    allowed_types: &[u8],
+) -> io::Result<(u8, Vec<u8>)> {
     let mut length_bytes = [0u8; 4];
 
     stream.read_exact(&mut length_bytes)?;
@@ -416,7 +438,7 @@ fn receive_ratchet_message<T: Transport + ?Sized>(
     stream.read_exact(&mut packet)?;
 
     if packet[0] != PROTOCOL_VERSION
-        || packet[1] != MESSAGE_TYPE_TEXT
+        || !allowed_types.contains(&packet[1])
         || packet[2..18] != session_id[..]
     {
         return Err(io::Error::new(
@@ -457,7 +479,11 @@ fn receive_ratchet_message<T: Transport + ?Sized>(
         .map_err(|_| io::Error::other("Ratchet mutex poisoned"))?;
 
     let padded_message = ratchet
-        .ratchet_decrypt(&header, ciphertext, &packet_associated_data(session_id))
+        .ratchet_decrypt(
+            &header,
+            ciphertext,
+            &packet_associated_data_for_type(session_id, packet[1]),
+        )
         .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -465,48 +491,162 @@ fn receive_ratchet_message<T: Transport + ?Sized>(
             )
         })?;
 
-    unpad_message(&padded_message)
+    Ok((packet[1], unpad_message(&padded_message)?))
+}
+
+#[cfg(test)]
+fn receive_ratchet_message<T: Transport + ?Sized>(
+    stream: &mut T,
+    ratchet: &Arc<Mutex<Ratchet>>,
+    session_id: &[u8; 16],
+) -> io::Result<Vec<u8>> {
+    let (message_type, payload) =
+        receive_ratchet_packet(stream, ratchet, session_id, &[MESSAGE_TYPE_TEXT])?;
+
+    debug_assert_eq!(message_type, MESSAGE_TYPE_TEXT);
+
+    Ok(payload)
 }
 
 fn chat<T: Transport + 'static>(
-    mut stream: T,
+    stream: T,
     ratchet: Ratchet,
     session_id: [u8; 16],
 ) -> io::Result<()> {
-    stream.clear_timeouts()?;
-
     let ratchet = Arc::new(Mutex::new(ratchet));
+    let connected = Arc::new(AtomicBool::new(true));
 
-    let receive_ratchet = Arc::clone(&ratchet);
+    let send_stream: Arc<Mutex<Box<dyn Transport>>> =
+        Arc::new(Mutex::new(stream.try_clone_transport()?));
 
     let receive_stream = stream.try_clone_transport()?;
+    receive_stream.set_read_timeout(Some(Duration::from_secs(KEEPALIVE_SILENCE_SECS)))?;
+
+    let receive_ratchet = Arc::clone(&ratchet);
+    let ping_ratchet = Arc::clone(&ratchet);
+    let ping_stream = Arc::clone(&send_stream);
+    let receive_connected = Arc::clone(&connected);
 
     thread::spawn(move || {
         let mut stream = receive_stream;
+        let mut ping_sent = false;
 
         loop {
-            match receive_ratchet_message(&mut *stream, &receive_ratchet, &session_id) {
-                Ok(message) => {
-                    println!();
-                    println!("Friend: {}", String::from_utf8_lossy(&message));
+            match receive_ratchet_packet(
+                &mut *stream,
+                &receive_ratchet,
+                &session_id,
+                &[MESSAGE_TYPE_TEXT, MESSAGE_TYPE_PING, MESSAGE_TYPE_PONG],
+            ) {
+                Ok((message_type, message)) => {
+                    ping_sent = false;
 
-                    print!("You: ");
-                    io::stdout().flush().ok();
+                    if let Err(error) =
+                        stream.set_read_timeout(Some(Duration::from_secs(KEEPALIVE_SILENCE_SECS)))
+                    {
+                        println!();
+                        println!("Connection closed: {}", error);
+                        break;
+                    }
+
+                    match message_type {
+                        MESSAGE_TYPE_TEXT => {
+                            println!();
+                            println!("Friend: {}", String::from_utf8_lossy(&message));
+
+                            print!("You: ");
+                            io::stdout().flush().ok();
+                        }
+
+                        MESSAGE_TYPE_PING => {
+                            let mut ping_stream = match ping_stream.lock() {
+                                Ok(ping_stream) => ping_stream,
+                                Err(_) => {
+                                    println!();
+                                    println!("Connection closed: transport mutex poisoned");
+                                    break;
+                                }
+                            };
+
+                            if let Err(error) = send_ratchet_packet(
+                                &mut *ping_stream,
+                                &ping_ratchet,
+                                &session_id,
+                                MESSAGE_TYPE_PONG,
+                                &[],
+                            ) {
+                                println!();
+                                println!("Connection closed: {}", error);
+                                break;
+                            }
+                        }
+
+                        _ => {}
+                    }
+                }
+
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if ping_sent {
+                        println!();
+                        println!("Connection closed: keepalive timeout");
+                        break;
+                    }
+
+                    let mut ping_stream = match ping_stream.lock() {
+                        Ok(ping_stream) => ping_stream,
+                        Err(_) => {
+                            println!();
+                            println!("Connection closed: transport mutex poisoned");
+                            break;
+                        }
+                    };
+
+                    if let Err(error) = send_ratchet_packet(
+                        &mut *ping_stream,
+                        &ping_ratchet,
+                        &session_id,
+                        MESSAGE_TYPE_PING,
+                        &[],
+                    ) {
+                        println!();
+                        println!("Connection closed: {}", error);
+                        break;
+                    }
+
+                    drop(ping_stream);
+
+                    if let Err(error) =
+                        stream.set_read_timeout(Some(Duration::from_secs(KEEPALIVE_PONG_WAIT_SECS)))
+                    {
+                        println!();
+                        println!("Connection closed: {}", error);
+                        break;
+                    }
+
+                    ping_sent = true;
                 }
 
                 Err(error) => {
                     println!();
                     println!("Connection closed: {}", error);
-
                     break;
                 }
             }
         }
+
+        receive_connected.store(false, Ordering::SeqCst);
     });
 
     println!();
     println!("Double Ratchet chat started");
     println!("Per-message keys enabled");
+    println!(
+        "Keepalive enabled ({}s silence, {}s pong wait)",
+        KEEPALIVE_SILENCE_SECS, KEEPALIVE_PONG_WAIT_SECS
+    );
     println!("Type a message and press Enter");
     println!("Type /quit to leave");
     println!();
@@ -533,13 +673,24 @@ fn chat<T: Transport + 'static>(
             continue;
         }
 
-        if let Err(error) =
-            send_ratchet_message(&mut stream, &ratchet, &session_id, message.as_bytes())
-        {
-            println!("Failed to send message: {}", error);
-
+        if !connected.load(Ordering::SeqCst) {
+            println!("Connection closed by peer");
             break;
         }
+
+        let mut send_stream = send_stream
+            .lock()
+            .map_err(|_| io::Error::other("Transport mutex poisoned"))?;
+
+        if let Err(error) =
+            send_ratchet_message(&mut *send_stream, &ratchet, &session_id, message.as_bytes())
+        {
+            drop(send_stream);
+            println!("Failed to send message: {}", error);
+            break;
+        }
+
+        drop(send_stream);
 
         print!("You: ");
         io::stdout().flush().ok();
@@ -2530,6 +2681,69 @@ mod tests {
         assert!(!is_trusted(&stored, "ee:ff"));
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ping_pong_round_trip_works() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let bob_ratchet_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret));
+        let alice = create_ratchet_alice(&shared_secret, *bob_ratchet_public.as_bytes());
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let alice = Arc::new(Mutex::new(alice));
+        let bob = Arc::new(Mutex::new(bob));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        send_ratchet_packet(&mut client, &alice, &session_id, MESSAGE_TYPE_PING, b"").unwrap();
+        let (message_type, payload) =
+            receive_ratchet_packet(&mut server, &bob, &session_id, &[MESSAGE_TYPE_PING]).unwrap();
+        assert_eq!(message_type, MESSAGE_TYPE_PING);
+        assert!(payload.is_empty());
+
+        send_ratchet_packet(&mut server, &bob, &session_id, MESSAGE_TYPE_PONG, b"").unwrap();
+        let (message_type, payload) =
+            receive_ratchet_packet(&mut client, &alice, &session_id, &[MESSAGE_TYPE_PONG]).unwrap();
+        assert_eq!(message_type, MESSAGE_TYPE_PONG);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn packet_type_outside_allowed_set_is_rejected_and_state_preserved() {
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+
+        let bob_ratchet_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret));
+        let alice = create_ratchet_alice(&shared_secret, *bob_ratchet_public.as_bytes());
+        let bob = create_ratchet_bob(&shared_secret, bob_secret);
+
+        let alice = Arc::new(Mutex::new(alice));
+        let bob = Arc::new(Mutex::new(bob));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        send_ratchet_message(&mut client, &alice, &session_id, b"hello").unwrap();
+
+        assert!(
+            receive_ratchet_packet(&mut server, &bob, &session_id, &[MESSAGE_TYPE_PONG]).is_err()
+        );
+
+        send_ratchet_message(&mut client, &alice, &session_id, b"world").unwrap();
+
+        let received = receive_ratchet_message(&mut server, &bob, &session_id).unwrap();
+        assert_eq!(received, b"world");
     }
 
     #[test]
