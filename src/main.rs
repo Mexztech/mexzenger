@@ -1095,7 +1095,74 @@ fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
     start_server_on("127.0.0.1:9000", "I2P", signing_key)
 }
 
+fn encrypt_and_store_device_key(
+    path: &str,
+    signing_key: &SigningKey,
+    password: &[u8],
+) -> io::Result<()> {
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut salt).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    getrandom::fill(&mut nonce_bytes).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    let mut encryption_key = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(password, &salt, &mut *encryption_key)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key derivation failed"))?;
+    let cipher = ChaCha20Poly1305::new(&Key::from(*encryption_key));
+    let nonce =
+        Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let encrypted_key = cipher
+        .encrypt(&nonce, signing_key.to_bytes().as_ref())
+        .map_err(|_| io::Error::other("Failed to encrypt device key"))?;
+    let mut data = Vec::with_capacity(16 + 12 + encrypted_key.len());
+    data.extend_from_slice(&salt);
+    data.extend_from_slice(&nonce_bytes);
+    data.extend_from_slice(&encrypted_key);
+    let tmp_path = format!("{path}.tmp");
+    fs::write(&tmp_path, &data)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn create_device() -> io::Result<SigningKey> {
+    let password = Zeroizing::new(
+        prompt_password("Choose a device password: ")
+            .map_err(|e| io::Error::other(format!("Could not read password: {e}")))?,
+    );
+    let confirm = Zeroizing::new(
+        prompt_password("Confirm device password: ")
+            .map_err(|e| io::Error::other(format!("Could not read password: {e}")))?,
+    );
+    if password.as_bytes() != confirm.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Passwords do not match",
+        ));
+    }
+    if password.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Password cannot be empty",
+        ));
+    }
+    let mut secret = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *secret).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    let signing_key = SigningKey::from_bytes(&secret);
+    encrypt_and_store_device_key("device.key", &signing_key, password.as_bytes())?;
+    println!("New device created");
+    println!(
+        "Identity fingerprint: {}",
+        fingerprint(&signing_key.verifying_key())
+    );
+    Ok(signing_key)
+}
+
 fn unlock_device() -> io::Result<SigningKey> {
+    if !Path::new("device.key").exists() {
+        println!("No device found");
+        return create_device();
+    }
+
     let data = fs::read("device.key")?;
 
     if data.len() < 28 {
@@ -1170,30 +1237,7 @@ fn change_device_password(signing_key: &SigningKey) -> io::Result<()> {
         ));
     }
 
-    let mut salt = [0u8; 16];
-    let mut nonce_bytes = [0u8; 12];
-    getrandom::fill(&mut salt).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
-    getrandom::fill(&mut nonce_bytes).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
-
-    let mut encryption_key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(new_password.as_bytes(), &salt, &mut *encryption_key)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key derivation failed"))?;
-
-    let cipher = ChaCha20Poly1305::new(&Key::from(*encryption_key));
-    let nonce =
-        Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
-    let encrypted_key = cipher
-        .encrypt(&nonce, signing_key.to_bytes().as_ref())
-        .map_err(|_| io::Error::other("Failed to encrypt device key"))?;
-
-    let mut data = Vec::with_capacity(16 + 12 + encrypted_key.len());
-    data.extend_from_slice(&salt);
-    data.extend_from_slice(&nonce_bytes);
-    data.extend_from_slice(&encrypted_key);
-
-    fs::write("device.key.tmp", &data)?;
-    fs::rename("device.key.tmp", "device.key")?;
+    encrypt_and_store_device_key("device.key", signing_key, new_password.as_bytes())?;
     println!("Device password changed successfully.");
     Ok(())
 }
@@ -2413,6 +2457,35 @@ mod tests {
 
         assert_ne!(session_secret1, session_secret2);
         assert_ne!(session_id1, session_id2);
+    }
+
+    #[test]
+    fn device_key_round_trip_and_wrong_password_rejected() {
+        let path = "test_device_roundtrip.key";
+        let _ = fs::remove_file(path);
+        let signing_key = SigningKey::from_bytes(&[99u8; 32]);
+        encrypt_and_store_device_key(path, &signing_key, b"correct horse battery").unwrap();
+        let data = fs::read(path).unwrap();
+        assert!(data.len() > 28);
+        let salt = &data[0..16];
+        let nonce_bytes = &data[16..28];
+        let encrypted_key = &data[28..];
+        let mut encryption_key = Zeroizing::new([0u8; 32]);
+        Argon2::default()
+            .hash_password_into(b"correct horse battery", salt, &mut *encryption_key)
+            .unwrap();
+        let cipher = ChaCha20Poly1305::new(&Key::from(*encryption_key));
+        let nonce = Nonce::try_from(nonce_bytes).unwrap();
+        let decrypted = cipher.decrypt(&nonce, encrypted_key).unwrap();
+        let key_bytes: [u8; 32] = decrypted.try_into().unwrap();
+        assert_eq!(key_bytes, signing_key.to_bytes());
+        let mut wrong_key = Zeroizing::new([0u8; 32]);
+        Argon2::default()
+            .hash_password_into(b"wrong password", salt, &mut *wrong_key)
+            .unwrap();
+        let wrong_cipher = ChaCha20Poly1305::new(&Key::from(*wrong_key));
+        assert!(wrong_cipher.decrypt(&nonce, encrypted_key).is_err());
+        fs::remove_file(path).ok();
     }
 
     #[test]
