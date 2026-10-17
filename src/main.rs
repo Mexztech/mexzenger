@@ -195,34 +195,40 @@ fn fingerprint(key: &VerifyingKey) -> String {
         .join(":")
 }
 
-fn load_trusted_fingerprint() -> io::Result<Option<String>> {
-    if !Path::new(CONTACTS_FILE).exists() {
-        return Ok(None);
+fn load_trusted_fingerprints(path: &str) -> io::Result<Vec<String>> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
     }
 
-    let contents = fs::read_to_string(CONTACTS_FILE)?;
+    let contents = fs::read_to_string(path)?;
 
-    for line in contents.lines() {
-        let fingerprint = line.trim();
-
-        if !fingerprint.is_empty() {
-            return Ok(Some(fingerprint.to_string()));
-        }
-    }
-
-    Ok(None)
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
-fn save_trusted_fingerprint(fingerprint: &str) -> io::Result<()> {
+fn add_trusted_fingerprint(path: &str, fingerprint: &str) -> io::Result<()> {
+    let mut fingerprints = load_trusted_fingerprints(path)?;
+    fingerprints.push(fingerprint.to_string());
+
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(CONTACTS_FILE)?;
+        .open(path)?;
 
-    writeln!(file, "{}", fingerprint)?;
+    for entry in &fingerprints {
+        writeln!(file, "{}", entry)?;
+    }
 
     Ok(())
+}
+
+fn is_trusted(fingerprints: &[String], current: &str) -> bool {
+    fingerprints.iter().any(|trusted| trusted == current)
 }
 
 fn verify_or_pin_identity(identity: &VerifyingKey) -> bool {
@@ -232,64 +238,70 @@ fn verify_or_pin_identity(identity: &VerifyingKey) -> bool {
     println!("Remote identity fingerprint:");
     println!("{}", current);
 
-    match load_trusted_fingerprint() {
-        Ok(Some(trusted)) => {
-            println!();
-            println!("Trusted fingerprint:");
-            println!("{}", trusted);
-
-            if trusted == current {
-                println!("Identity matches trusted fingerprint");
-
-                true
-            } else {
-                println!();
-                println!("WARNING");
-                println!("Identity fingerprint changed");
-                println!("Connection refused");
-
-                false
-            }
+    let trusted = match load_trusted_fingerprints(CONTACTS_FILE) {
+        Ok(trusted) => trusted,
+        Err(error) => {
+            println!("Could not read contacts: {}", error);
+            return false;
         }
+    };
 
-        Ok(None) => {
-            println!();
-            println!("No trusted identity found");
+    if is_trusted(&trusted, &current) {
+        println!();
+        println!("Identity matches a trusted contact");
 
-            print!("Trust and save this identity? [y/N]: ");
+        return true;
+    }
 
-            io::stdout().flush().ok();
+    if trusted.is_empty() {
+        println!();
+        println!("No trusted identity found");
+        print!("Trust and save this identity? [y/N]: ");
+    } else {
+        println!();
+        println!(
+            "Unknown identity ({} trusted contacts on file)",
+            trusted.len()
+        );
+        print!("Trust and add this identity? [y/N]: ");
+    }
 
-            let mut answer = String::new();
+    io::stdout().flush().ok();
 
-            if io::stdin().read_line(&mut answer).is_err() {
-                return false;
-            }
+    let mut answer = String::new();
 
-            if answer.trim().eq_ignore_ascii_case("y") {
-                match save_trusted_fingerprint(&current) {
-                    Ok(()) => {
-                        println!("Identity pinned");
-                        true
-                    }
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
 
-                    Err(error) => {
-                        println!("Could not save trusted identity: {}", error);
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        println!("Identity not trusted");
+        return false;
+    }
 
-                        false
-                    }
-                }
-            } else {
-                println!("Identity not trusted");
-                false
-            }
+    match add_trusted_fingerprint(CONTACTS_FILE, &current) {
+        Ok(()) => {
+            println!("Identity pinned");
+            true
         }
 
         Err(error) => {
-            println!("Could not read contacts: {}", error);
-
+            println!("Could not save trusted identity: {}", error);
             false
         }
+    }
+}
+
+fn list_contacts() {
+    match load_trusted_fingerprints(CONTACTS_FILE) {
+        Ok(fingerprints) if fingerprints.is_empty() => println!("No trusted contacts"),
+        Ok(fingerprints) => {
+            println!("Trusted contacts:");
+            for (index, entry) in fingerprints.iter().enumerate() {
+                println!("{}. {}", index + 1, entry);
+            }
+        }
+        Err(error) => println!("Could not read contacts: {}", error),
     }
 }
 
@@ -1259,6 +1271,7 @@ fn main() -> io::Result<()> {
     println!("2 = client");
     println!("3 = Tor server");
     println!("4 = I2P server");
+    println!("5 = list contacts");
 
     let mut input = String::new();
 
@@ -1289,6 +1302,10 @@ fn main() -> io::Result<()> {
 
         "4" => {
             start_i2p_server(&signing_key)?;
+        }
+
+        "5" => {
+            list_contacts();
         }
 
         _ => {
@@ -2490,6 +2507,28 @@ mod tests {
             .unwrap();
         let wrong_cipher = ChaCha20Poly1305::new(&Key::from(*wrong_key));
         assert!(wrong_cipher.decrypt(&nonce, encrypted_key).is_err());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn multiple_contacts_are_stored_and_matched() {
+        let path = "test_contacts_store.txt";
+        let _ = fs::remove_file(path);
+
+        assert!(load_trusted_fingerprints(path).unwrap().is_empty());
+
+        let first = "aa:bb".to_string();
+        let second = "cc:dd".to_string();
+
+        add_trusted_fingerprint(path, &first).unwrap();
+        add_trusted_fingerprint(path, &second).unwrap();
+
+        let stored = load_trusted_fingerprints(path).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(is_trusted(&stored, &first));
+        assert!(is_trusted(&stored, &second));
+        assert!(!is_trusted(&stored, "ee:ff"));
+
         fs::remove_file(path).ok();
     }
 
