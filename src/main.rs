@@ -1062,6 +1062,14 @@ fn start_tor_server(signing_key: &SigningKey) -> io::Result<()> {
     start_server_on("127.0.0.1:9000", "Tor", signing_key)
 }
 
+fn with_default_port(address: &str, default_port: u16) -> String {
+    if address.contains(':') {
+        address.to_string()
+    } else {
+        format!("{address}:{default_port}")
+    }
+}
+
 fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
     println!("Connecting to {}...", address);
 
@@ -1070,7 +1078,7 @@ fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
         transport::connect_i2p(i2p_address)?
     } else if let Some(tor_address) = address.strip_prefix("tor://") {
         println!("Routing connection through Tor...");
-        transport::connect_tor(tor_address)?
+        transport::connect_tor(&with_default_port(tor_address, 9000))?
     } else {
         transport::connect(address)?
     };
@@ -2752,6 +2760,15 @@ mod tests {
 
         let received = receive_ratchet_message(&mut server, &bob, &session_id).unwrap();
         assert_eq!(received, b"world");
+    }
+
+    #[test]
+    fn tor_address_gets_default_port() {
+        assert_eq!(with_default_port("abc123.onion", 9000), "abc123.onion:9000");
+        assert_eq!(
+            with_default_port("abc123.onion:1234", 9000),
+            "abc123.onion:1234"
+        );
     }
 
     #[test]
