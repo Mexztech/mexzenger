@@ -75,6 +75,7 @@ pub fn connect(address: &str) -> io::Result<Box<dyn Transport>> {
 
 struct I2pTransportInner {
     runtime: Arc<Runtime>,
+    _session: yosemite::Session<yosemite::style::Stream>,
     reader: Mutex<I2pReadHalf>,
     writer: Mutex<I2pWriteHalf>,
     timeout: Mutex<Option<Duration>>,
@@ -111,11 +112,15 @@ impl I2pTransport {
                 &address[address.len().saturating_sub(20)..]
             );
 
-            session
+            let stream = session
                 .connect(&address)
                 .await
-                .map_err(|e| io::Error::other(format!("I2P connect: {e}")))
+                .map_err(|e| io::Error::other(format!("I2P connect: {e}")))?;
+
+            Ok::<_, io::Error>((session, stream))
         })?;
+
+        let (session, stream) = stream;
 
         let (reader, writer) = stream
             .split()
@@ -124,6 +129,7 @@ impl I2pTransport {
         Ok(Box::new(Self {
             inner: Arc::new(I2pTransportInner {
                 runtime,
+                _session: session,
                 reader: Mutex::new(reader),
                 writer: Mutex::new(writer),
                 timeout: Mutex::new(None),

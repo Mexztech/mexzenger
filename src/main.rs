@@ -1220,11 +1220,19 @@ fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
 
         let tx_ready = tx.clone();
         let result = runtime.block_on(async move {
-            let mut session = I2pSession::<I2pStream>::new(Default::default())
+            let (destination, private_key) = yosemite::RouterApi::default()
+                .generate_destination()
                 .await
-                .map_err(|error| io::Error::other(format!("I2P session: {error}")))?;
+                .map_err(|error| io::Error::other(format!("I2P destination: {error}")))?;
 
-            let destination = session.destination().to_string();
+            let mut session = I2pSession::<I2pStream>::new(yosemite::SessionOptions {
+                destination: yosemite::DestinationKind::Persistent { private_key },
+                silent_forward: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("I2P session: {error}")))?;
+
             #[cfg(debug_assertions)]
             eprintln!(
                 "I2P DEST DEBUG: len={} sha256={}",

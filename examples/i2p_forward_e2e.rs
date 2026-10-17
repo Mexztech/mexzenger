@@ -5,13 +5,16 @@ use yosemite::{Session, SessionOptions, style::Stream};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (destination, private_key) = yosemite::RouterApi::default()
+        .generate_destination()
+        .await?;
+
     let mut server = Session::<Stream>::new(SessionOptions {
         silent_forward: true,
+        destination: yosemite::DestinationKind::Persistent { private_key },
         ..Default::default()
     })
     .await?;
-
-    let destination = server.destination().to_owned();
     println!(
         "I2P DEST DEBUG: len={} sha256={}",
         destination.len(),
