@@ -45,7 +45,7 @@ impl Transport for TcpStream {
     }
 
     fn set_handshake_timeouts(&self) -> io::Result<()> {
-        self.set_read_timeout(Some(Duration::from_secs(30)))?;
+        self.set_read_timeout(Some(Duration::from_secs(300)))?;
         self.set_write_timeout(Some(Duration::from_secs(30)))?;
         Ok(())
     }
@@ -163,7 +163,7 @@ impl Transport for I2pTransport {
             .timeout
             .lock()
             .map_err(|_| io::Error::other("I2P timeout mutex poisoned"))?;
-        *timeout = Some(Duration::from_secs(30));
+        *timeout = Some(Duration::from_secs(300));
         Ok(())
     }
 
@@ -283,7 +283,7 @@ impl Transport for TorTransport {
             .timeout
             .lock()
             .map_err(|_| io::Error::other("Tor timeout mutex poisoned"))?;
-        *timeout = Some(Duration::from_secs(30));
+        *timeout = Some(Duration::from_secs(300));
         Ok(())
     }
 
