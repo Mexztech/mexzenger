@@ -787,7 +787,9 @@ fn chat<T: Transport + 'static>(
     stream: T,
     ratchet: Ratchet,
     session_id: [u8; 16],
+    peer: String,
 ) -> io::Result<()> {
+    let history = Arc::new(Mutex::new(HistoryLogger::new(HISTORY_FILE)));
     let ratchet = Arc::new(Mutex::new(ratchet));
     let connected = Arc::new(AtomicBool::new(true));
 
@@ -798,6 +800,8 @@ fn chat<T: Transport + 'static>(
     receive_stream.set_read_timeout(Some(Duration::from_secs(KEEPALIVE_SILENCE_SECS)))?;
 
     let receive_ratchet = Arc::clone(&ratchet);
+    let receive_history = Arc::clone(&history);
+    let receive_peer = peer.clone();
     let ping_ratchet = Arc::clone(&ratchet);
     let ping_stream = Arc::clone(&send_stream);
     let receive_connected = Arc::clone(&connected);
@@ -828,6 +832,13 @@ fn chat<T: Transport + 'static>(
                         MESSAGE_TYPE_TEXT => {
                             println!();
                             println!("Friend: {}", String::from_utf8_lossy(&message));
+
+                            if let Err(error) = receive_history
+                                .lock()
+                                .map(|mut logger| logger.log(&receive_peer, false, &message))
+                            {
+                                println!("Could not write history: {}", error);
+                            }
 
                             print!("You: ");
                             io::stdout().flush().ok();
@@ -966,6 +977,13 @@ fn chat<T: Transport + 'static>(
         }
 
         drop(send_stream);
+
+        if let Err(error) = history
+            .lock()
+            .map(|mut logger| logger.log(&peer, true, message.as_bytes()))
+        {
+            println!("Could not write history: {}", error);
+        }
 
         print!("You: ");
         io::stdout().flush().ok();
@@ -1199,7 +1217,7 @@ fn serve_connection(
 
     let ratchet = create_ratchet_bob(&shared_secret, *ratchet_secret.as_bytes());
 
-    chat(stream, ratchet, session_id)
+    chat(stream, ratchet, session_id, fingerprint(&remote_identity))
 }
 
 fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) -> io::Result<()> {
@@ -1482,7 +1500,7 @@ fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
 
     let ratchet = create_ratchet_alice(&shared_secret, *server_ratchet_x25519.as_bytes());
 
-    chat(stream, ratchet, session_id)
+    chat(stream, ratchet, session_id, fingerprint(&server_identity))
 }
 
 fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
@@ -1725,6 +1743,7 @@ fn main() -> io::Result<()> {
     println!("3 = Tor server");
     println!("4 = I2P server");
     println!("5 = list contacts");
+    println!("6 = show history");
 
     let mut input = String::new();
 
@@ -1759,6 +1778,10 @@ fn main() -> io::Result<()> {
 
         "5" => {
             list_contacts();
+        }
+
+        "6" => {
+            show_history();
         }
 
         _ => {
