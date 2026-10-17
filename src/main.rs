@@ -79,6 +79,7 @@ impl RngCore for SystemRng {
 impl CryptoRng for SystemRng {}
 
 fn send_public_key<T: Transport + ?Sized>(stream: &mut T, public_key: &[u8; 32]) -> io::Result<()> {
+    #[cfg(debug_assertions)]
     eprintln!(
         "PUBLIC KEY SEND: sha256={}",
         Sha256::digest(public_key)
@@ -93,6 +94,7 @@ fn send_public_key<T: Transport + ?Sized>(stream: &mut T, public_key: &[u8; 32])
 fn receive_public_key<T: Transport + ?Sized>(stream: &mut T) -> io::Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     stream.read_exact(&mut bytes)?;
+    #[cfg(debug_assertions)]
     eprintln!(
         "PUBLIC KEY RECV: sha256={}",
         Sha256::digest(bytes)
@@ -126,6 +128,7 @@ fn send_identity_key<T: Transport + ?Sized>(
     signing_key: &SigningKey,
 ) -> io::Result<()> {
     let verifying_key = signing_key.verifying_key();
+    #[cfg(debug_assertions)]
     eprintln!(
         "IDENTITY SEND: sha256={}",
         Sha256::digest(verifying_key.as_bytes())
@@ -146,6 +149,7 @@ fn receive_identity<T: Transport + ?Sized>(stream: &mut T) -> io::Result<Verifyi
     let mut identity_bytes = [0u8; 32];
     stream.read_exact(&mut identity_bytes)?;
 
+    #[cfg(debug_assertions)]
     eprintln!(
         "IDENTITY RECV: sha256={}",
         Sha256::digest(identity_bytes)
@@ -1058,6 +1062,7 @@ fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
                 .map_err(|error| io::Error::other(format!("I2P session: {error}")))?;
 
             let destination = session.destination().to_string();
+            #[cfg(debug_assertions)]
             eprintln!(
                 "I2P DEST DEBUG: len={} sha256={}",
                 destination.len(),

@@ -92,6 +92,7 @@ impl I2pTransport {
             Arc::new(Runtime::new().map_err(|e| io::Error::other(format!("Tokio runtime: {e}")))?);
 
         let address = address.trim().to_string();
+        #[cfg(debug_assertions)]
         eprintln!(
             "I2P DEST LEN={} START={:?} END={:?}",
             address.len(),
@@ -103,6 +104,7 @@ impl I2pTransport {
                 .await
                 .map_err(|e| io::Error::other(format!("I2P session: {e}")))?;
 
+            #[cfg(debug_assertions)]
             eprintln!(
                 "I2P CONNECT DEBUG: len={} prefix={:?} suffix={:?}",
                 address.len(),
