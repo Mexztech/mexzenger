@@ -497,7 +497,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 const MESSAGE_TYPE_FILE_META: u8 = 4;
 const MESSAGE_TYPE_FILE_CHUNK: u8 = 5;
-const FILE_FRAGMENT_SIZE: usize = PLAINTEXT_SIZE - 4;
+const FILE_FRAGMENT_SIZE: usize = MAX_MESSAGE_SIZE - 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileMeta {
@@ -3463,8 +3463,8 @@ cc:dd
 
     #[test]
     fn file_fragment_size_is_correct() {
-        assert_eq!(FILE_FRAGMENT_SIZE, PLAINTEXT_SIZE - 4);
-        assert_eq!(FILE_FRAGMENT_SIZE, 4018);
+        assert_eq!(FILE_FRAGMENT_SIZE, MAX_MESSAGE_SIZE - 4);
+        assert_eq!(FILE_FRAGMENT_SIZE, 4014);
 
         let empty = plan_file_transfer("empty", 0);
         assert_eq!(empty.chunk_count, 0);
