@@ -2144,7 +2144,7 @@ fn start_mailbox_server(signing_key: &SigningKey) -> io::Result<()> {
     start_server_on("0.0.0.0:9000", "TCP mailbox", signing_key, true)
 }
 
-fn start_tor_server(signing_key: &SigningKey) -> io::Result<()> {
+fn start_tor_server(signing_key: &SigningKey, mailbox_mode: bool) -> io::Result<()> {
     use arti_client::{TorClient, TorClientConfig};
     use safelog::DisplayRedacted;
     use std::sync::mpsc;
@@ -2248,7 +2248,7 @@ fn start_tor_server(signing_key: &SigningKey) -> io::Result<()> {
     println!("Tor onion service: {onion_address}");
     println!("Forwarding onion port 9000 -> 127.0.0.1:9000");
 
-    start_server_on("127.0.0.1:9000", "Tor", signing_key, false)
+    start_server_on("127.0.0.1:9000", "Tor", signing_key, mailbox_mode)
 }
 
 fn with_default_port(address: &str, default_port: u16) -> String {
@@ -2405,7 +2405,7 @@ fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
     )
 }
 
-fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
+fn start_i2p_server(signing_key: &SigningKey, mailbox_mode: bool) -> io::Result<()> {
     use std::sync::mpsc;
     use tokio::runtime::Runtime;
     use yosemite::{Session as I2pSession, style::Stream as I2pStream};
@@ -2471,7 +2471,7 @@ fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
     println!("I2P destination: {destination}");
     println!("Forwarding I2P -> 127.0.0.1:9000");
 
-    start_server_on("127.0.0.1:9000", "I2P", signing_key, false)
+    start_server_on("127.0.0.1:9000", "I2P", signing_key, mailbox_mode)
 }
 
 fn encrypt_and_store_device_key(
@@ -2648,6 +2648,8 @@ fn main() -> io::Result<()> {
     println!("6 = show history");
     println!("7 = read mailbox");
     println!("8 = mailbox server");
+    println!("9 = Tor mailbox server");
+    println!("10 = I2P mailbox server");
 
     let mut input = String::new();
 
@@ -2673,11 +2675,11 @@ fn main() -> io::Result<()> {
         }
 
         "3" => {
-            start_tor_server(&signing_key)?;
+            start_tor_server(&signing_key, false)?;
         }
 
         "4" => {
-            start_i2p_server(&signing_key)?;
+            start_i2p_server(&signing_key, false)?;
         }
 
         "5" => {
@@ -2694,6 +2696,14 @@ fn main() -> io::Result<()> {
 
         "8" => {
             start_mailbox_server(&signing_key)?;
+        }
+
+        "9" => {
+            start_tor_server(&signing_key, true)?;
+        }
+
+        "10" => {
+            start_i2p_server(&signing_key, true)?;
         }
 
         _ => {
