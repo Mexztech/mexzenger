@@ -1095,6 +1095,23 @@ fn record_voice_note(path: &str, seconds: u64) -> io::Result<()> {
     fs::write(path, &file_data)
 }
 
+fn latest_voice_note() -> Option<String> {
+    let entries = fs::read_dir(".").ok()?;
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("received_vnote-") || !name.ends_with(".pmv") {
+            continue;
+        }
+        let modified = entry.metadata().ok()?.modified().ok()?;
+        match &newest {
+            Some((time, _)) if *time >= modified => {}
+            _ => newest = Some((modified, name)),
+        }
+    }
+    newest.map(|(_, name)| name)
+}
+
 fn play_voice_note(path: &str) -> io::Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let data = fs::read(path)?;
@@ -1522,11 +1539,23 @@ fn chat<T: Transport + 'static>(
             continue;
         }
 
-        if let Some(argument) = message.strip_prefix("/vplay ") {
+        if let Some(argument) = message.strip_prefix("/vplay") {
             let path = argument.trim();
-            if path.is_empty() {
-                println!("Usage: /vplay <file>");
-            } else if let Err(error) = play_voice_note(path) {
+            let path = if path.is_empty() {
+                match latest_voice_note() {
+                    Some(path) => path,
+                    None => {
+                        println!("No voice note found (usage: /vplay <file>)");
+                        print!("You: ");
+                        io::stdout().flush().ok();
+                        continue;
+                    }
+                }
+            } else {
+                path.to_string()
+            };
+            println!("Playing {} ...", path);
+            if let Err(error) = play_voice_note(&path) {
                 println!("Playback failed: {}", error);
             }
             print!("You: ");
