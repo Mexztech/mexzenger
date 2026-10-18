@@ -7,7 +7,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit},
 };
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ksi_double_ratchet::{DoubleRatchet, Header};
@@ -725,6 +725,152 @@ fn synthesize_sine(samples: usize) -> Vec<i16> {
         })
         .collect()
 }
+const MAILBOX_FILE: &str = "mailbox";
+const MAILBOX_ENVELOPE_OVERHEAD: usize = 140;
+
+fn mailbox_secret(signing: &SigningKey) -> x25519_dalek::StaticSecret {
+    let expanded = sha2::Sha512::digest(signing.to_bytes());
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&expanded[..32]);
+    x25519_dalek::StaticSecret::from(bytes)
+}
+
+fn mailbox_public(verifying: &VerifyingKey) -> io::Result<x25519_dalek::PublicKey> {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    let point = CompressedEdwardsY(*verifying.as_bytes())
+        .decompress()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid identity key"))?;
+    Ok(x25519_dalek::PublicKey::from(
+        point.to_montgomery().to_bytes(),
+    ))
+}
+
+fn seal_mailbox_message(
+    signing: &SigningKey,
+    recipient: &VerifyingKey,
+    message: &[u8],
+) -> io::Result<Vec<u8>> {
+    let recipient_public = mailbox_public(recipient)?;
+    let ephemeral = x25519_dalek::StaticSecret::random_from_rng(&mut rand::rng());
+    let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral);
+    let shared = ephemeral.diffie_hellman(&recipient_public);
+    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-mailbox-v1"), shared.as_bytes());
+    let mut key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"deposit-key", &mut *key)
+        .expect("HKDF expansion failed");
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut nonce_bytes).map_err(|e| io::Error::other(format!("RNG failed: {e}")))?;
+    let nonce =
+        Nonce::try_from(nonce_bytes.as_slice()).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    let ciphertext = cipher
+        .encrypt(&nonce, message)
+        .map_err(|_| io::Error::other("Failed to seal mailbox message"))?;
+    let mut signed = Vec::with_capacity(32 + 12 + ciphertext.len());
+    signed.extend_from_slice(ephemeral_public.as_bytes());
+    signed.extend_from_slice(&nonce_bytes);
+    signed.extend_from_slice(&ciphertext);
+    let signature = signing.sign(&signed);
+    let mut envelope = Vec::with_capacity(MAILBOX_ENVELOPE_OVERHEAD + ciphertext.len());
+    envelope.extend_from_slice(ephemeral_public.as_bytes());
+    envelope.extend_from_slice(signing.verifying_key().as_bytes());
+    envelope.extend_from_slice(signature.to_bytes().as_ref());
+    envelope.extend_from_slice(&nonce_bytes);
+    envelope.extend_from_slice(&ciphertext);
+    Ok(envelope)
+}
+
+fn open_mailbox_message(
+    signing: &SigningKey,
+    envelope: &[u8],
+) -> io::Result<(VerifyingKey, Vec<u8>)> {
+    if envelope.len() < MAILBOX_ENVELOPE_OVERHEAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid mailbox envelope",
+        ));
+    }
+    let ephemeral_bytes: [u8; 32] = envelope[0..32].try_into().unwrap();
+    let sender_bytes: [u8; 32] = envelope[32..64].try_into().unwrap();
+    let signature = Signature::from_bytes(&envelope[64..128].try_into().unwrap());
+    let nonce =
+        Nonce::try_from(&envelope[128..140]).map_err(|_| io::Error::other("Invalid nonce"))?;
+    let ciphertext = &envelope[140..];
+    let sender = VerifyingKey::from_bytes(&sender_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid sender identity"))?;
+    let mut signed = Vec::with_capacity(32 + 12 + ciphertext.len());
+    signed.extend_from_slice(&ephemeral_bytes);
+    signed.extend_from_slice(&envelope[128..140]);
+    signed.extend_from_slice(ciphertext);
+    if sender.verify_strict(&signed, &signature).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid mailbox signature",
+        ));
+    }
+    if !ratchet::is_valid_x25519_public_key(&ephemeral_bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid ephemeral key",
+        ));
+    }
+    let shared =
+        mailbox_secret(signing).diffie_hellman(&x25519_dalek::PublicKey::from(ephemeral_bytes));
+    let hkdf = Hkdf::<Sha256>::new(Some(b"private-messenger-mailbox-v1"), shared.as_bytes());
+    let mut key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(b"deposit-key", &mut *key)
+        .expect("HKDF expansion failed");
+    let cipher = ChaCha20Poly1305::new(&Key::from(*key));
+    let message = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Could not decrypt mailbox message (wrong key or corrupted)",
+        )
+    })?;
+    Ok((sender, message))
+}
+
+fn mailbox_append(path: &str, envelope: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(&(envelope.len() as u32).to_be_bytes())?;
+    file.write_all(envelope)
+}
+
+fn mailbox_read(path: &str) -> io::Result<Vec<Vec<u8>>> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read(path)?;
+    let mut records = Vec::new();
+    let mut position = 0;
+    while position < data.len() {
+        if position + 4 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated mailbox record",
+            ));
+        }
+        let length = u32::from_be_bytes(data[position..position + 4].try_into().unwrap()) as usize;
+        position += 4;
+        if position + length > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated mailbox record",
+            ));
+        }
+        records.push(data[position..position + length].to_vec());
+        position += length;
+    }
+    Ok(records)
+}
+
+fn mailbox_clear(path: &str) -> io::Result<()> {
+    fs::write(path, &[])
+}
+
 fn show_history() {
     match history_read(HISTORY_FILE) {
         Ok(entries) if entries.is_empty() => println!("No history"),
@@ -3862,6 +4008,47 @@ cc:dd
 
         let same = resample_linear(&[0.25, -0.5], 48000, 48000);
         assert_eq!(same, vec![0.25, -0.5]);
+    }
+    #[test]
+    fn mailbox_seal_open_round_trip() {
+        let alice = SigningKey::from_bytes(&[201u8; 32]);
+        let bob = SigningKey::from_bytes(&[202u8; 32]);
+
+        let envelope =
+            seal_mailbox_message(&alice, &bob.verifying_key(), b"offline hello").unwrap();
+
+        let (sender, opened) = open_mailbox_message(&bob, &envelope).unwrap();
+        assert_eq!(sender, alice.verifying_key());
+        assert_eq!(opened, b"offline hello");
+
+        assert!(open_mailbox_message(&alice, &envelope).is_err());
+
+        let mut bad = envelope.clone();
+        bad[150] ^= 1;
+        assert!(open_mailbox_message(&bob, &bad).is_err());
+
+        let mut bad_sig = envelope.clone();
+        bad_sig[64] ^= 1;
+        assert!(open_mailbox_message(&bob, &bad_sig).is_err());
+    }
+
+    #[test]
+    fn mailbox_storage_round_trip() {
+        let path = "test_mailbox.bin";
+        let _ = fs::remove_file(path);
+
+        assert!(mailbox_read(path).unwrap().is_empty());
+
+        mailbox_append(path, &[1, 2, 3]).unwrap();
+        mailbox_append(path, &[9u8; 500]).unwrap();
+
+        let records = mailbox_read(path).unwrap();
+        assert_eq!(records, vec![vec![1, 2, 3], vec![9u8; 500]]);
+
+        mailbox_clear(path).unwrap();
+        assert!(mailbox_read(path).unwrap().is_empty());
+
+        fs::remove_file(path).ok();
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {

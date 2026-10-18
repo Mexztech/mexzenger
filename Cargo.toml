@@ -28,4 +28,5 @@ x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 yosemite = "0.7.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
 cpal = "0.15"
+curve25519-dalek = "5"
 audiopus = "0.2"
