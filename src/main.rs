@@ -499,6 +499,10 @@ const MESSAGE_TYPE_FILE_META: u8 = 4;
 const MESSAGE_TYPE_FILE_CHUNK: u8 = 5;
 const MESSAGE_TYPE_MAILBOX_DEPOSIT: u8 = 6;
 const MESSAGE_TYPE_MAILBOX_ACK: u8 = 7;
+const MESSAGE_TYPE_MAILBOX_META: u8 = 8;
+const MESSAGE_TYPE_MAILBOX_CHUNK: u8 = 9;
+const MAILBOX_FRAGMENT_SIZE: usize = MAX_MESSAGE_SIZE - 4;
+const MAILBOX_FILE_MAGIC: &[u8; 4] = b"PMFW";
 const FILE_FRAGMENT_SIZE: usize = MAX_MESSAGE_SIZE - 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1377,12 +1381,187 @@ fn send_file<T: Transport + ?Sized>(
     Ok(())
 }
 
+struct MailboxDeposit {
+    total_len: u64,
+    chunk_count: u32,
+    label: String,
+    chunks: std::collections::BTreeMap<u32, Vec<u8>>,
+}
+
+impl MailboxDeposit {
+    fn new(total_len: u64, chunk_count: u32, label: String) -> Self {
+        Self {
+            total_len,
+            chunk_count,
+            label,
+            chunks: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn add_chunk(&mut self, index: u32, data: &[u8]) -> io::Result<bool> {
+        if index >= self.chunk_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Chunk index out of range",
+            ));
+        }
+        self.chunks.entry(index).or_insert_with(|| data.to_vec());
+        Ok(self.is_complete())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.chunks.len() as u32 == self.chunk_count
+    }
+
+    fn assemble(&self) -> io::Result<Vec<u8>> {
+        if !self.is_complete() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Deposit incomplete",
+            ));
+        }
+        let mut out = Vec::with_capacity(self.total_len as usize);
+        for index in 0..self.chunk_count {
+            let chunk = self
+                .chunks
+                .get(&index)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing chunk"))?;
+            out.extend_from_slice(chunk);
+        }
+        if out.len() as u64 != self.total_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Assembled size mismatch",
+            ));
+        }
+        Ok(out)
+    }
+}
+
+fn make_mailbox_meta(total_len: u64, chunk_count: u32, label: &str) -> io::Result<Vec<u8>> {
+    let label_bytes = label.as_bytes();
+    if label_bytes.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Label too long",
+        ));
+    }
+    let mut out = Vec::with_capacity(8 + 4 + 2 + label_bytes.len());
+    out.extend_from_slice(&total_len.to_be_bytes());
+    out.extend_from_slice(&chunk_count.to_be_bytes());
+    out.extend_from_slice(&(label_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(label_bytes);
+    Ok(out)
+}
+
+fn parse_mailbox_meta(data: &[u8]) -> io::Result<(u64, u32, String)> {
+    if data.len() < 8 + 4 + 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid mailbox meta",
+        ));
+    }
+    let total_len = u64::from_be_bytes(data[0..8].try_into().unwrap());
+    let chunk_count = u32::from_be_bytes(data[8..12].try_into().unwrap());
+    let label_len = u16::from_be_bytes([data[12], data[13]]) as usize;
+    if data.len() != 14 + label_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid mailbox meta length",
+        ));
+    }
+    let label = String::from_utf8_lossy(&data[14..14 + label_len]).to_string();
+    Ok((total_len, chunk_count, label))
+}
+
+fn make_mailbox_chunk(index: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + data.len());
+    out.extend_from_slice(&index.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+fn parse_mailbox_chunk(data: &[u8]) -> io::Result<(u32, &[u8])> {
+    if data.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid mailbox chunk",
+        ));
+    }
+    let index = u32::from_be_bytes(data[..4].try_into().unwrap());
+    Ok((index, &data[4..]))
+}
+
+fn wrap_mailbox_file(label: &str, data: &[u8]) -> io::Result<Vec<u8>> {
+    let label_bytes = label.as_bytes();
+    if label_bytes.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Label too long",
+        ));
+    }
+    let mut out = Vec::with_capacity(4 + 2 + label_bytes.len() + data.len());
+    out.extend_from_slice(MAILBOX_FILE_MAGIC);
+    out.extend_from_slice(&(label_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(label_bytes);
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
+fn unwrap_mailbox_file(data: &[u8]) -> io::Result<(String, Vec<u8>)> {
+    if data.len() < 6 || !data.starts_with(MAILBOX_FILE_MAGIC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid file attachment",
+        ));
+    }
+    let label_len = u16::from_be_bytes([data[4], data[5]]) as usize;
+    if data.len() < 6 + label_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Truncated file attachment",
+        ));
+    }
+    let label = String::from_utf8_lossy(&data[6..6 + label_len]).to_string();
+    Ok((label, data[6 + label_len..].to_vec()))
+}
+
+fn send_mailbox_blob<T: Transport + ?Sized>(
+    stream: &mut T,
+    ratchet: &Arc<Mutex<Ratchet>>,
+    session_id: &[u8; 16],
+    envelope: &[u8],
+    label: &str,
+) -> io::Result<usize> {
+    let chunk_count = envelope.len().div_ceil(MAILBOX_FRAGMENT_SIZE) as u32;
+    let meta = make_mailbox_meta(envelope.len() as u64, chunk_count, label)?;
+    send_ratchet_packet(
+        stream,
+        ratchet,
+        session_id,
+        MESSAGE_TYPE_MAILBOX_META,
+        &meta,
+    )?;
+    for (index, chunk) in envelope.chunks(MAILBOX_FRAGMENT_SIZE).enumerate() {
+        let framed = make_mailbox_chunk(index as u32, chunk);
+        send_ratchet_packet(
+            stream,
+            ratchet,
+            session_id,
+            MESSAGE_TYPE_MAILBOX_CHUNK,
+            &framed,
+        )?;
+    }
+    Ok(chunk_count as usize)
+}
+
 fn mailbox_session<T: Transport + ?Sized>(
     stream: &mut T,
     ratchet: &Arc<Mutex<Ratchet>>,
     session_id: &[u8; 16],
 ) -> io::Result<()> {
     let mut received = 0usize;
+    let mut pending: Option<MailboxDeposit> = None;
     loop {
         match receive_ratchet_packet(
             stream,
@@ -1390,6 +1569,8 @@ fn mailbox_session<T: Transport + ?Sized>(
             session_id,
             &[
                 MESSAGE_TYPE_MAILBOX_DEPOSIT,
+                MESSAGE_TYPE_MAILBOX_META,
+                MESSAGE_TYPE_MAILBOX_CHUNK,
                 MESSAGE_TYPE_PING,
                 MESSAGE_TYPE_PONG,
             ],
@@ -1415,6 +1596,57 @@ fn mailbox_session<T: Transport + ?Sized>(
                     Err(error) => println!("Mailbox store failed: {}", error),
                 }
             }
+            Ok((MESSAGE_TYPE_MAILBOX_META, payload)) => match parse_mailbox_meta(&payload) {
+                Ok((total_len, chunk_count, label)) => {
+                    println!();
+                    println!(
+                        "Mailbox: receiving deposit {} ({} bytes, {} chunks)",
+                        label, total_len, chunk_count
+                    );
+                    pending = Some(MailboxDeposit::new(total_len, chunk_count, label));
+                }
+                Err(error) => println!("Invalid mailbox meta: {}", error),
+            },
+            Ok((MESSAGE_TYPE_MAILBOX_CHUNK, payload)) => {
+                let outcome = parse_mailbox_chunk(&payload).and_then(|(index, data)| {
+                    let deposit = pending.as_mut().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Chunk without meta")
+                    })?;
+                    deposit.add_chunk(index, data)
+                });
+                match outcome {
+                    Ok(true) => {
+                        let deposit = match pending.take() {
+                            Some(deposit) => deposit,
+                            None => continue,
+                        };
+                        match deposit.assemble() {
+                            Ok(envelope) => match mailbox_append(MAILBOX_FILE, &envelope) {
+                                Ok(()) => {
+                                    received += 1;
+                                    println!();
+                                    println!(
+                                        "Mailbox: stored message {} ({} bytes)",
+                                        received,
+                                        envelope.len()
+                                    );
+                                    send_ratchet_packet(
+                                        stream,
+                                        ratchet,
+                                        session_id,
+                                        MESSAGE_TYPE_MAILBOX_ACK,
+                                        &[],
+                                    )?;
+                                }
+                                Err(error) => println!("Mailbox store failed: {}", error),
+                            },
+                            Err(error) => println!("Mailbox assemble failed: {}", error),
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => println!("Mailbox chunk error: {}", error),
+                }
+            }
             Ok((MESSAGE_TYPE_PING, _)) => {
                 send_ratchet_packet(stream, ratchet, session_id, MESSAGE_TYPE_PONG, &[])?;
             }
@@ -1438,12 +1670,38 @@ fn read_mailbox_menu(signing_key: &SigningKey) {
             for record in &records {
                 match open_mailbox_message(signing_key, record) {
                     Ok((sender, message)) => {
-                        opened += 1;
-                        println!(
-                            "[from {}] {}",
-                            fingerprint(&sender),
-                            String::from_utf8_lossy(&message)
-                        );
+                        if message.starts_with(MAILBOX_FILE_MAGIC) {
+                            match unwrap_mailbox_file(&message) {
+                                Ok((label, file_data)) => {
+                                    let safe_label =
+                                        label.rsplit('/').next().unwrap_or("file").to_string();
+                                    let out_path = format!("received_mail_{}", safe_label);
+                                    match fs::write(&out_path, &file_data) {
+                                        Ok(()) => {
+                                            opened += 1;
+                                            println!(
+                                                "[from {}] [file] {} ({} bytes) saved as {}",
+                                                fingerprint(&sender),
+                                                safe_label,
+                                                file_data.len(),
+                                                out_path
+                                            );
+                                        }
+                                        Err(error) => {
+                                            println!("Could not save attachment: {}", error)
+                                        }
+                                    }
+                                }
+                                Err(error) => println!("Could not parse attachment: {}", error),
+                            }
+                        } else {
+                            opened += 1;
+                            println!(
+                                "[from {}] {}",
+                                fingerprint(&sender),
+                                String::from_utf8_lossy(&message)
+                            );
+                        }
                     }
                     Err(error) => println!("Could not open message: {}", error),
                 }
@@ -1705,6 +1963,8 @@ fn chat<T: Transport + 'static>(
     println!("Type /vnote <seconds> to record a voice note");
     println!("Type /vplay <file> to play a voice note");
     println!("Type /mail <message> to deposit into the peer mailbox");
+    println!("Type /mailfile <path> to deposit a file into the peer mailbox");
+    println!("Type /mailvnote <seconds> to deposit a voice note into the peer mailbox");
     println!();
 
     print!("You: ");
@@ -1828,6 +2088,101 @@ fn chat<T: Transport + 'static>(
                     }
                     Err(error) => println!("Could not seal message: {}", error),
                 }
+            }
+            print!("You: ");
+            io::stdout().flush().ok();
+            continue;
+        }
+
+        if let Some(argument) = message.strip_prefix("/mailfile ") {
+            let path = argument.trim();
+            if path.is_empty() {
+                println!("Usage: /mailfile <path>");
+            } else {
+                let result = (|| -> io::Result<usize> {
+                    let data = fs::read(path)?;
+                    let name = Path::new(path)
+                        .file_name()
+                        .map(|part| part.to_string_lossy().to_string())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path")
+                        })?;
+                    let wrapped = wrap_mailbox_file(&name, &data)?;
+                    let envelope = seal_mailbox_message(&signing_key, &remote_identity, &wrapped)?;
+                    let mut stream_guard = send_stream
+                        .lock()
+                        .map_err(|_| io::Error::other("Transport mutex poisoned"))?;
+                    let chunks = send_mailbox_blob(
+                        &mut *stream_guard,
+                        &ratchet,
+                        &session_id,
+                        &envelope,
+                        &name,
+                    )?;
+                    println!(
+                        "Mailbox deposit sent: {} ({} bytes, {} chunks)",
+                        name,
+                        envelope.len(),
+                        chunks
+                    );
+                    Ok(chunks)
+                })();
+                if let Err(error) = result {
+                    println!("Deposit failed: {}", error);
+                }
+            }
+            print!("You: ");
+            io::stdout().flush().ok();
+            continue;
+        }
+
+        if let Some(argument) = message.strip_prefix("/mailvnote ") {
+            let seconds: u64 = match argument.trim().parse::<u64>() {
+                Ok(value) => value.clamp(1, 30),
+                Err(_) => {
+                    println!("Usage: /mailvnote <seconds> (1-30)");
+                    print!("You: ");
+                    io::stdout().flush().ok();
+                    continue;
+                }
+            };
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let path = format!("vnote-{stamp}.pmv");
+            match record_voice_note(&path, seconds) {
+                Ok(()) => {
+                    let result = (|| -> io::Result<()> {
+                        let data = fs::read(&path)?;
+                        let name = Path::new(&path)
+                            .file_name()
+                            .map(|part| part.to_string_lossy().to_string())
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path")
+                            })?;
+                        let wrapped = wrap_mailbox_file(&name, &data)?;
+                        let envelope =
+                            seal_mailbox_message(&signing_key, &remote_identity, &wrapped)?;
+                        let mut stream_guard = send_stream
+                            .lock()
+                            .map_err(|_| io::Error::other("Transport mutex poisoned"))?;
+                        send_mailbox_blob(
+                            &mut *stream_guard,
+                            &ratchet,
+                            &session_id,
+                            &envelope,
+                            &name,
+                        )?;
+                        println!("Voice note deposited: {} ({} bytes)", name, envelope.len());
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        println!("Deposit failed: {}", error);
+                    }
+                    let _ = fs::remove_file(&path);
+                }
+                Err(error) => println!("Recording failed: {}", error),
             }
             print!("You: ");
             io::stdout().flush().ok();
@@ -4294,6 +4649,119 @@ cc:dd
         )
         .unwrap();
         assert_eq!(message_type, MESSAGE_TYPE_MAILBOX_ACK);
+    }
+    #[test]
+    fn mailbox_chunk_framing_round_trip() {
+        let meta = make_mailbox_meta(12_345, 4, "vnote-1.pmv").unwrap();
+        let (total_len, chunk_count, label) = parse_mailbox_meta(&meta).unwrap();
+        assert_eq!(total_len, 12_345);
+        assert_eq!(chunk_count, 4);
+        assert_eq!(label, "vnote-1.pmv");
+        assert!(parse_mailbox_meta(&meta[..meta.len() - 1]).is_err());
+
+        let chunk = make_mailbox_chunk(3, &[7, 8, 9]);
+        let (index, data) = parse_mailbox_chunk(&chunk).unwrap();
+        assert_eq!(index, 3);
+        assert_eq!(data, &[7, 8, 9]);
+        assert!(parse_mailbox_chunk(&[1, 2]).is_err());
+    }
+
+    #[test]
+    fn mailbox_deposit_reassembles_out_of_order() {
+        let blob: Vec<u8> = (0u32..10_000).map(|n| (n % 253) as u8).collect();
+        let chunk_count = blob.len().div_ceil(MAILBOX_FRAGMENT_SIZE) as u32;
+        let mut deposit =
+            MailboxDeposit::new(blob.len() as u64, chunk_count, "blob.bin".to_string());
+
+        for index in (0..chunk_count).rev() {
+            let start = index as usize * MAILBOX_FRAGMENT_SIZE;
+            let end = (start + MAILBOX_FRAGMENT_SIZE).min(blob.len());
+            let chunk = make_mailbox_chunk(index, &blob[start..end]);
+            let (chunk_index, data) = parse_mailbox_chunk(&chunk).unwrap();
+            let complete = deposit.add_chunk(chunk_index, data).unwrap();
+            if chunk_index != 0 {
+                assert!(!complete);
+            }
+        }
+
+        assert!(deposit.is_complete());
+        assert_eq!(deposit.assemble().unwrap(), blob);
+        assert!(deposit.add_chunk(chunk_count, b"x").is_err());
+    }
+
+    #[test]
+    fn mailbox_file_wrapper_round_trip() {
+        let wrapped = wrap_mailbox_file("note.pmv", b"audio bytes here").unwrap();
+        let (label, data) = unwrap_mailbox_file(&wrapped).unwrap();
+        assert_eq!(label, "note.pmv");
+        assert_eq!(data, b"audio bytes here");
+
+        let mut bad = wrapped.clone();
+        bad[14] ^= 1;
+        let (_, data) = unwrap_mailbox_file(&bad).unwrap();
+        assert_ne!(data, b"audio bytes here");
+        assert!(unwrap_mailbox_file(&wrapped[..5]).is_err());
+    }
+    #[test]
+    fn mailbox_chunked_deposit_over_tcp() {
+        let _ = set_contacts_key(b"mailbox-chunk-test");
+
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+        let bob_ratchet_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret));
+        let alice = Arc::new(Mutex::new(create_ratchet_alice(
+            &shared_secret,
+            *bob_ratchet_public.as_bytes(),
+        )));
+        let bob = Arc::new(Mutex::new(create_ratchet_bob(&shared_secret, bob_secret)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let alice_key = SigningKey::from_bytes(&[221u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[222u8; 32]);
+        let payload = wrap_mailbox_file("big.bin", &vec![0xABu8; 50_000]).unwrap();
+        let envelope =
+            seal_mailbox_message(&alice_key, &bob_key.verifying_key(), &payload).unwrap();
+
+        let chunks =
+            send_mailbox_blob(&mut client, &alice, &session_id, &envelope, "big.bin").unwrap();
+        assert!(chunks > 1);
+
+        let (message_type, meta_payload) =
+            receive_ratchet_packet(&mut server, &bob, &session_id, &[MESSAGE_TYPE_MAILBOX_META])
+                .unwrap();
+        assert_eq!(message_type, MESSAGE_TYPE_MAILBOX_META);
+        let (total_len, chunk_count, label) = parse_mailbox_meta(&meta_payload).unwrap();
+        assert_eq!(total_len, envelope.len() as u64);
+        assert_eq!(chunk_count, chunks as u32);
+        assert_eq!(label, "big.bin");
+
+        let mut deposit = MailboxDeposit::new(total_len, chunk_count, label);
+        for _ in 0..chunk_count {
+            let (message_type, chunk_payload) = receive_ratchet_packet(
+                &mut server,
+                &bob,
+                &session_id,
+                &[MESSAGE_TYPE_MAILBOX_CHUNK],
+            )
+            .unwrap();
+            assert_eq!(message_type, MESSAGE_TYPE_MAILBOX_CHUNK);
+            let (index, data) = parse_mailbox_chunk(&chunk_payload).unwrap();
+            deposit.add_chunk(index, data).unwrap();
+        }
+
+        let assembled = deposit.assemble().unwrap();
+        assert_eq!(assembled, envelope);
+        let (sender, opened) = open_mailbox_message(&bob_key, &assembled).unwrap();
+        assert_eq!(sender, alice_key.verifying_key());
+        let (label, data) = unwrap_mailbox_file(&opened).unwrap();
+        assert_eq!(label, "big.bin");
+        assert_eq!(data, vec![0xABu8; 50_000]);
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
