@@ -9,7 +9,7 @@ An experimental Rust messenger exploring encrypted communication, key exchange, 
 - TCP handshake and encrypted messaging tests
 - Double ratchet tests
 - Experimental Tor and I2P transport work
-- 41 tests currently passing
+- 58 tests currently passing
 
 ## Security warning
 
