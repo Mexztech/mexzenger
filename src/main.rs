@@ -681,7 +681,7 @@ fn parse_vnote_file(data: &[u8]) -> io::Result<Vec<Vec<u8>>> {
 
 fn opus_encode_samples(samples: &[i16]) -> io::Result<Vec<Vec<u8>>> {
     use audiopus::{Application, Channels, SampleRate, coder::Encoder};
-    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
+    let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
         .map_err(|e| io::Error::other(format!("Opus encoder: {e}")))?;
     let mut frames = Vec::new();
     let mut position = 0;
@@ -1012,6 +1012,172 @@ fn receive_ratchet_message<T: Transport + ?Sized>(
     Ok(payload)
 }
 
+fn resample_linear(samples: &[f32], from_rate: usize, to_rate: usize) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let out_len = samples.len() * to_rate / from_rate;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let pos = i as f64 * from_rate as f64 / to_rate as f64;
+        let index = pos as usize;
+        let fraction = (pos - index as f64) as f32;
+        let a = samples.get(index).copied().unwrap_or(0.0);
+        let b = samples.get(index + 1).copied().unwrap_or(a);
+        out.push(a + (b - a) * fraction);
+    }
+    out
+}
+
+fn record_voice_note(path: &str, seconds: u64) -> io::Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| io::Error::other("No microphone found"))?;
+    let supported = device
+        .default_input_config()
+        .map_err(|e| io::Error::other(format!("No input config: {e}")))?;
+    let mut config = supported.config();
+    config.channels = 1;
+    let sample_rate = config.sample_rate.0 as usize;
+    let captured = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let captured_clone = Arc::clone(&captured);
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config,
+            move |data: &[f32], _| {
+                if let Ok(mut buffer) = captured_clone.lock() {
+                    buffer.extend_from_slice(data);
+                }
+            },
+            |e| eprintln!("audio input error: {e}"),
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config,
+            move |data: &[i16], _| {
+                if let Ok(mut buffer) = captured_clone.lock() {
+                    buffer.extend(data.iter().map(|sample| *sample as f32 / i16::MAX as f32));
+                }
+            },
+            |e| eprintln!("audio input error: {e}"),
+            None,
+        ),
+        other => {
+            return Err(io::Error::other(format!(
+                "Unsupported sample format: {other:?}"
+            )));
+        }
+    }
+    .map_err(|e| io::Error::other(format!("Could not open microphone: {e}")))?;
+    stream
+        .play()
+        .map_err(|e| io::Error::other(format!("Could not start recording: {e}")))?;
+    println!("Recording for {} seconds...", seconds);
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    drop(stream);
+    let captured = captured
+        .lock()
+        .map_err(|_| io::Error::other("Audio buffer mutex poisoned"))?
+        .clone();
+    if captured.iter().all(|sample| sample.abs() < 0.001) {
+        return Err(io::Error::other("No audio captured (silent microphone?)"));
+    }
+    let resampled = resample_linear(&captured, sample_rate, VNOTE_SAMPLE_RATE);
+    let samples: Vec<i16> = resampled
+        .iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+        .collect();
+    let frames = opus_encode_samples(&samples)?;
+    let file_data = build_vnote_file(&frames);
+    fs::write(path, &file_data)
+}
+
+fn play_voice_note(path: &str) -> io::Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let data = fs::read(path)?;
+    let frames = parse_vnote_file(&data)?;
+    let samples = opus_decode_frames(&frames)?;
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| io::Error::other("No audio output device found"))?;
+    let supported = device
+        .default_output_config()
+        .map_err(|e| io::Error::other(format!("No output config: {e}")))?;
+    let mut config = supported.config();
+    config.channels = 1;
+    let sample_rate = config.sample_rate.0 as usize;
+    let source: Vec<f32> = samples
+        .iter()
+        .map(|sample| *sample as f32 / i16::MAX as f32)
+        .collect();
+    let playback = Arc::new(Mutex::new(resample_linear(
+        &source,
+        VNOTE_SAMPLE_RATE,
+        sample_rate,
+    )));
+    let position = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let playback = Arc::clone(&playback);
+            let position = Arc::clone(&position);
+            device.build_output_stream(
+                &config,
+                move |out: &mut [f32], _| {
+                    let buffer = playback.lock().unwrap();
+                    let mut pos = position.load(Ordering::Relaxed);
+                    for sample in out.iter_mut() {
+                        *sample = if pos < buffer.len() { buffer[pos] } else { 0.0 };
+                        pos += 1;
+                    }
+                    position.store(pos, Ordering::Relaxed);
+                },
+                |e| eprintln!("audio output error: {e}"),
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let playback = Arc::clone(&playback);
+            let position = Arc::clone(&position);
+            device.build_output_stream(
+                &config,
+                move |out: &mut [i16], _| {
+                    let buffer = playback.lock().unwrap();
+                    let mut pos = position.load(Ordering::Relaxed);
+                    for sample in out.iter_mut() {
+                        *sample = if pos < buffer.len() {
+                            (buffer[pos].clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+                        } else {
+                            0
+                        };
+                        pos += 1;
+                    }
+                    position.store(pos, Ordering::Relaxed);
+                },
+                |e| eprintln!("audio output error: {e}"),
+                None,
+            )
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "Unsupported sample format: {other:?}"
+            )));
+        }
+    }
+    .map_err(|e| io::Error::other(format!("Could not open audio output: {e}")))?;
+    stream
+        .play()
+        .map_err(|e| io::Error::other(format!("Could not start playback: {e}")))?;
+    let total = playback.lock().unwrap().len();
+    while position.load(Ordering::Relaxed) < total {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(stream);
+    Ok(())
+}
+
 fn send_file<T: Transport + ?Sized>(
     stream: &mut T,
     ratchet: &Arc<Mutex<Ratchet>>,
@@ -1277,6 +1443,8 @@ fn chat<T: Transport + 'static>(
     println!("Type a message and press Enter");
     println!("Type /quit to leave");
     println!("Type /send <path> to send a file");
+    println!("Type /vnote <seconds> to record a voice note");
+    println!("Type /vplay <file> to play a voice note");
     println!();
 
     print!("You: ");
@@ -1313,6 +1481,52 @@ fn chat<T: Transport + 'static>(
                     Ok(()) => println!("File sent: {}", path),
                     Err(error) => println!("Failed to send file: {}", error),
                 }
+            }
+            print!("You: ");
+            io::stdout().flush().ok();
+            continue;
+        }
+
+        if let Some(argument) = message.strip_prefix("/vnote ") {
+            let seconds: u64 = match argument.trim().parse::<u64>() {
+                Ok(value) => value.clamp(1, 30),
+                Err(_) => {
+                    println!("Usage: /vnote <seconds> (1-30)");
+                    print!("You: ");
+                    io::stdout().flush().ok();
+                    continue;
+                }
+            };
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let path = format!("vnote-{stamp}.pmv");
+            match record_voice_note(&path, seconds) {
+                Ok(()) => {
+                    let mut stream_guard = send_stream
+                        .lock()
+                        .map_err(|_| io::Error::other("Transport mutex poisoned"))?;
+                    match send_file(&mut *stream_guard, &ratchet, &session_id, &path) {
+                        Ok(()) => println!("Voice note sent: {}", path),
+                        Err(error) => println!("Failed to send voice note: {}", error),
+                    }
+                    drop(stream_guard);
+                    let _ = fs::remove_file(&path);
+                }
+                Err(error) => println!("Recording failed: {}", error),
+            }
+            print!("You: ");
+            io::stdout().flush().ok();
+            continue;
+        }
+
+        if let Some(argument) = message.strip_prefix("/vplay ") {
+            let path = argument.trim();
+            if path.is_empty() {
+                println!("Usage: /vplay <file>");
+            } else if let Err(error) = play_voice_note(path) {
+                println!("Playback failed: {}", error);
             }
             print!("You: ");
             io::stdout().flush().ok();
@@ -3608,6 +3822,16 @@ cc:dd
 
         let best = best_lag_correlation(&samples, &decoded, 1200);
         assert!(best > 0.9, "best lag correlation {best} too low");
+    }
+    #[test]
+    fn linear_resample_inserts_midpoints() {
+        let up = resample_linear(&[0.0, 1.0], 24000, 48000);
+        assert_eq!(up.len(), 4);
+        assert!((up[1] - 0.5).abs() < 1e-6);
+        assert!((up[2] - 1.0).abs() < 1e-6);
+
+        let same = resample_linear(&[0.25, -0.5], 48000, 48000);
+        assert_eq!(same, vec![0.25, -0.5]);
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
