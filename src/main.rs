@@ -921,6 +921,39 @@ fn receive_ratchet_message<T: Transport + ?Sized>(
     Ok(payload)
 }
 
+fn send_file<T: Transport + ?Sized>(
+    stream: &mut T,
+    ratchet: &Arc<Mutex<Ratchet>>,
+    session_id: &[u8; 16],
+    path: &str,
+) -> io::Result<()> {
+    let data = fs::read(path)?;
+    let name = Path::new(path)
+        .file_name()
+        .map(|part| part.to_string_lossy().to_string())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path"))?;
+    let meta = plan_file_transfer(&name, data.len() as u64);
+    let meta_payload = serialize_file_meta(&meta)?;
+    send_ratchet_packet(
+        stream,
+        ratchet,
+        session_id,
+        MESSAGE_TYPE_FILE_META,
+        &meta_payload,
+    )?;
+    println!(
+        "Sending {} ({} bytes, {} chunks)...",
+        meta.name, meta.total_size, meta.chunk_count
+    );
+    for index in 0..meta.chunk_count {
+        let start = index as usize * FILE_FRAGMENT_SIZE;
+        let end = (start + FILE_FRAGMENT_SIZE).min(data.len());
+        let chunk = make_file_chunk(index, &data[start..end]);
+        send_ratchet_packet(stream, ratchet, session_id, MESSAGE_TYPE_FILE_CHUNK, &chunk)?;
+    }
+    Ok(())
+}
+
 fn chat<T: Transport + 'static>(
     stream: T,
     ratchet: Ratchet,
@@ -928,6 +961,7 @@ fn chat<T: Transport + 'static>(
     peer: String,
 ) -> io::Result<()> {
     let history = Arc::new(Mutex::new(HistoryLogger::new(HISTORY_FILE)));
+    let incoming_file: Arc<Mutex<Option<IncomingFile>>> = Arc::new(Mutex::new(None));
     let ratchet = Arc::new(Mutex::new(ratchet));
     let connected = Arc::new(AtomicBool::new(true));
 
@@ -940,6 +974,7 @@ fn chat<T: Transport + 'static>(
     let receive_ratchet = Arc::clone(&ratchet);
     let receive_history = Arc::clone(&history);
     let receive_peer = peer.clone();
+    let receive_incoming = Arc::clone(&incoming_file);
     let ping_ratchet = Arc::clone(&ratchet);
     let ping_stream = Arc::clone(&send_stream);
     let receive_connected = Arc::clone(&connected);
@@ -953,7 +988,13 @@ fn chat<T: Transport + 'static>(
                 &mut *stream,
                 &receive_ratchet,
                 &session_id,
-                &[MESSAGE_TYPE_TEXT, MESSAGE_TYPE_PING, MESSAGE_TYPE_PONG],
+                &[
+                    MESSAGE_TYPE_TEXT,
+                    MESSAGE_TYPE_PING,
+                    MESSAGE_TYPE_PONG,
+                    MESSAGE_TYPE_FILE_META,
+                    MESSAGE_TYPE_FILE_CHUNK,
+                ],
             ) {
                 Ok((message_type, message)) => {
                     ping_sent = false;
@@ -1002,6 +1043,77 @@ fn chat<T: Transport + 'static>(
                                 println!();
                                 println!("Connection closed: {}", error);
                                 break;
+                            }
+                        }
+
+                        MESSAGE_TYPE_FILE_META => match parse_file_meta(&message) {
+                            Ok(meta) => {
+                                println!();
+                                println!(
+                                    "Receiving file: {} ({} bytes, {} chunks)",
+                                    meta.name, meta.total_size, meta.chunk_count
+                                );
+                                match receive_incoming.lock() {
+                                    Ok(mut slot) => *slot = Some(IncomingFile::new(meta)),
+                                    Err(_) => println!("Could not accept file: mutex poisoned"),
+                                }
+                            }
+                            Err(error) => println!("Invalid file meta: {}", error),
+                        },
+
+                        MESSAGE_TYPE_FILE_CHUNK => {
+                            let outcome = parse_file_chunk(&message).and_then(|(index, data)| {
+                                let mut slot = receive_incoming.lock().map_err(|_| {
+                                    io::Error::other("Incoming file mutex poisoned")
+                                })?;
+                                let incoming = slot.as_mut().ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "File chunk without meta",
+                                    )
+                                })?;
+                                incoming.add_chunk(index, data)
+                            });
+                            match outcome {
+                                Ok(true) => {
+                                    let completed = receive_incoming.lock().ok().and_then(|slot| {
+                                        slot.as_ref().and_then(|incoming| {
+                                            incoming
+                                                .assemble()
+                                                .ok()
+                                                .map(|data| (incoming.meta.name.clone(), data))
+                                        })
+                                    });
+                                    match completed {
+                                        Some((name, data)) => {
+                                            let safe_name = name
+                                                .rsplit('/')
+                                                .next()
+                                                .unwrap_or("received")
+                                                .to_string();
+                                            let out_path = format!("received_{}", safe_name);
+                                            match fs::write(&out_path, &data) {
+                                                Ok(()) => println!(
+                                                    "File received: {} ({} bytes)",
+                                                    out_path,
+                                                    data.len()
+                                                ),
+                                                Err(error) => println!(
+                                                    "Could not write received file: {}",
+                                                    error
+                                                ),
+                                            }
+                                            if let Ok(mut slot) = receive_incoming.lock() {
+                                                *slot = None;
+                                            }
+                                        }
+                                        None => {
+                                            println!("File transfer error: could not assemble file")
+                                        }
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => println!("File transfer error: {}", error),
                             }
                         }
 
@@ -1073,6 +1185,7 @@ fn chat<T: Transport + 'static>(
     );
     println!("Type a message and press Enter");
     println!("Type /quit to leave");
+    println!("Type /send <path> to send a file");
     println!();
 
     print!("You: ");
@@ -1092,6 +1205,24 @@ fn chat<T: Transport + 'static>(
         }
 
         if message.is_empty() {
+            print!("You: ");
+            io::stdout().flush().ok();
+            continue;
+        }
+
+        if let Some(path) = message.strip_prefix("/send ") {
+            let path = path.trim();
+            if path.is_empty() {
+                println!("Usage: /send <file path>");
+            } else {
+                let mut stream_guard = send_stream
+                    .lock()
+                    .map_err(|_| io::Error::other("Transport mutex poisoned"))?;
+                match send_file(&mut *stream_guard, &ratchet, &session_id, path) {
+                    Ok(()) => println!("File sent: {}", path),
+                    Err(error) => println!("Failed to send file: {}", error),
+                }
+            }
             print!("You: ");
             io::stdout().flush().ok();
             continue;
