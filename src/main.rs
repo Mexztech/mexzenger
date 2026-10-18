@@ -870,7 +870,7 @@ fn mailbox_read(path: &str) -> io::Result<Vec<Vec<u8>>> {
 }
 
 fn mailbox_clear(path: &str) -> io::Result<()> {
-    fs::write(path, &[])
+    fs::write(path, [])
 }
 
 fn show_history() {
