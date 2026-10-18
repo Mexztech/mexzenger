@@ -497,6 +497,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 const MESSAGE_TYPE_FILE_META: u8 = 4;
 const MESSAGE_TYPE_FILE_CHUNK: u8 = 5;
+const MESSAGE_TYPE_MAILBOX_DEPOSIT: u8 = 6;
+const MESSAGE_TYPE_MAILBOX_ACK: u8 = 7;
 const FILE_FRAGMENT_SIZE: usize = MAX_MESSAGE_SIZE - 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1375,12 +1377,96 @@ fn send_file<T: Transport + ?Sized>(
     Ok(())
 }
 
+fn mailbox_session<T: Transport + ?Sized>(
+    stream: &mut T,
+    ratchet: &Arc<Mutex<Ratchet>>,
+    session_id: &[u8; 16],
+) -> io::Result<()> {
+    let mut received = 0usize;
+    loop {
+        match receive_ratchet_packet(
+            stream,
+            ratchet,
+            session_id,
+            &[
+                MESSAGE_TYPE_MAILBOX_DEPOSIT,
+                MESSAGE_TYPE_PING,
+                MESSAGE_TYPE_PONG,
+            ],
+        ) {
+            Ok((MESSAGE_TYPE_MAILBOX_DEPOSIT, envelope)) => {
+                match mailbox_append(MAILBOX_FILE, &envelope) {
+                    Ok(()) => {
+                        received += 1;
+                        println!();
+                        println!(
+                            "Mailbox: stored message {} ({} bytes)",
+                            received,
+                            envelope.len()
+                        );
+                        send_ratchet_packet(
+                            stream,
+                            ratchet,
+                            session_id,
+                            MESSAGE_TYPE_MAILBOX_ACK,
+                            &[],
+                        )?;
+                    }
+                    Err(error) => println!("Mailbox store failed: {}", error),
+                }
+            }
+            Ok((MESSAGE_TYPE_PING, _)) => {
+                send_ratchet_packet(stream, ratchet, session_id, MESSAGE_TYPE_PONG, &[])?;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                println!();
+                println!("Mailbox session ended: {}", error);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_mailbox_menu(signing_key: &SigningKey) {
+    match mailbox_read(MAILBOX_FILE) {
+        Ok(records) if records.is_empty() => println!("Mailbox is empty"),
+        Ok(records) => {
+            let total = records.len();
+            let mut opened = 0usize;
+            for record in &records {
+                match open_mailbox_message(signing_key, record) {
+                    Ok((sender, message)) => {
+                        opened += 1;
+                        println!(
+                            "[from {}] {}",
+                            fingerprint(&sender),
+                            String::from_utf8_lossy(&message)
+                        );
+                    }
+                    Err(error) => println!("Could not open message: {}", error),
+                }
+            }
+            if opened == total {
+                match mailbox_clear(MAILBOX_FILE) {
+                    Ok(()) => println!("Mailbox cleared ({} messages)", opened),
+                    Err(error) => println!("Could not clear mailbox: {}", error),
+                }
+            }
+        }
+        Err(error) => println!("Could not read mailbox: {}", error),
+    }
+}
+
 fn chat<T: Transport + 'static>(
     stream: T,
     ratchet: Ratchet,
     session_id: [u8; 16],
-    peer: String,
+    remote_identity: VerifyingKey,
+    signing_key: SigningKey,
 ) -> io::Result<()> {
+    let peer = fingerprint(&remote_identity);
     let history = Arc::new(Mutex::new(HistoryLogger::new(HISTORY_FILE)));
     let incoming_file: Arc<Mutex<Option<IncomingFile>>> = Arc::new(Mutex::new(None));
     let ratchet = Arc::new(Mutex::new(ratchet));
@@ -1415,6 +1501,7 @@ fn chat<T: Transport + 'static>(
                     MESSAGE_TYPE_PONG,
                     MESSAGE_TYPE_FILE_META,
                     MESSAGE_TYPE_FILE_CHUNK,
+                    MESSAGE_TYPE_MAILBOX_ACK,
                 ],
             ) {
                 Ok((message_type, message)) => {
@@ -1538,6 +1625,14 @@ fn chat<T: Transport + 'static>(
                             }
                         }
 
+                        MESSAGE_TYPE_MAILBOX_ACK => {
+                            println!();
+                            println!("Mailbox: message stored by peer");
+
+                            print!("You: ");
+                            io::stdout().flush().ok();
+                        }
+
                         _ => {}
                     }
                 }
@@ -1609,6 +1704,7 @@ fn chat<T: Transport + 'static>(
     println!("Type /send <path> to send a file");
     println!("Type /vnote <seconds> to record a voice note");
     println!("Type /vplay <file> to play a voice note");
+    println!("Type /mail <message> to deposit into the peer mailbox");
     println!();
 
     print!("You: ");
@@ -1703,6 +1799,35 @@ fn chat<T: Transport + 'static>(
             println!("Playing {} ...", path);
             if let Err(error) = play_voice_note(&path) {
                 println!("Playback failed: {}", error);
+            }
+            print!("You: ");
+            io::stdout().flush().ok();
+            continue;
+        }
+
+        if let Some(argument) = message.strip_prefix("/mail ") {
+            let text = argument.trim();
+            if text.is_empty() {
+                println!("Usage: /mail <message>");
+            } else {
+                match seal_mailbox_message(&signing_key, &remote_identity, text.as_bytes()) {
+                    Ok(envelope) => {
+                        let mut stream_guard = send_stream
+                            .lock()
+                            .map_err(|_| io::Error::other("Transport mutex poisoned"))?;
+                        match send_ratchet_packet(
+                            &mut *stream_guard,
+                            &ratchet,
+                            &session_id,
+                            MESSAGE_TYPE_MAILBOX_DEPOSIT,
+                            &envelope,
+                        ) {
+                            Ok(()) => println!("Mailbox deposit sent ({} bytes)", envelope.len()),
+                            Err(error) => println!("Failed to deposit: {}", error),
+                        }
+                    }
+                    Err(error) => println!("Could not seal message: {}", error),
+                }
             }
             print!("You: ");
             io::stdout().flush().ok();
@@ -1859,6 +1984,7 @@ fn serve_connection(
     mut stream: Box<dyn Transport>,
     address: &str,
     signing_key: &SigningKey,
+    mailbox_mode: bool,
 ) -> io::Result<()> {
     println!("Connected to {}", address);
 
@@ -1967,10 +2093,26 @@ fn serve_connection(
 
     let ratchet = create_ratchet_bob(&shared_secret, *ratchet_secret.as_bytes());
 
-    chat(stream, ratchet, session_id, fingerprint(&remote_identity))
+    if mailbox_mode {
+        let ratchet = Arc::new(Mutex::new(ratchet));
+        mailbox_session(&mut *stream, &ratchet, &session_id)
+    } else {
+        chat(
+            stream,
+            ratchet,
+            session_id,
+            remote_identity,
+            signing_key.clone(),
+        )
+    }
 }
 
-fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) -> io::Result<()> {
+fn start_server_on(
+    bind_address: &str,
+    label: &str,
+    signing_key: &SigningKey,
+    mailbox_mode: bool,
+) -> io::Result<()> {
     let listener = transport::listen(bind_address)?;
 
     println!("Listening on {bind_address} ({label})...");
@@ -1987,7 +2129,7 @@ fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) ->
             }
         };
 
-        match serve_connection(stream, &address, signing_key) {
+        match serve_connection(stream, &address, signing_key, mailbox_mode) {
             Ok(()) => return Ok(()),
             Err(error) => eprintln!("Connection failed: {error}"),
         }
@@ -1995,7 +2137,11 @@ fn start_server_on(bind_address: &str, label: &str, signing_key: &SigningKey) ->
 }
 
 fn start_server(signing_key: &SigningKey) -> io::Result<()> {
-    start_server_on("0.0.0.0:9000", "TCP", signing_key)
+    start_server_on("0.0.0.0:9000", "TCP", signing_key, false)
+}
+
+fn start_mailbox_server(signing_key: &SigningKey) -> io::Result<()> {
+    start_server_on("0.0.0.0:9000", "TCP mailbox", signing_key, true)
 }
 
 fn start_tor_server(signing_key: &SigningKey) -> io::Result<()> {
@@ -2102,7 +2248,7 @@ fn start_tor_server(signing_key: &SigningKey) -> io::Result<()> {
     println!("Tor onion service: {onion_address}");
     println!("Forwarding onion port 9000 -> 127.0.0.1:9000");
 
-    start_server_on("127.0.0.1:9000", "Tor", signing_key)
+    start_server_on("127.0.0.1:9000", "Tor", signing_key, false)
 }
 
 fn with_default_port(address: &str, default_port: u16) -> String {
@@ -2250,7 +2396,13 @@ fn start_client(address: &str, signing_key: &SigningKey) -> io::Result<()> {
 
     let ratchet = create_ratchet_alice(&shared_secret, *server_ratchet_x25519.as_bytes());
 
-    chat(stream, ratchet, session_id, fingerprint(&server_identity))
+    chat(
+        stream,
+        ratchet,
+        session_id,
+        server_identity,
+        signing_key.clone(),
+    )
 }
 
 fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
@@ -2319,7 +2471,7 @@ fn start_i2p_server(signing_key: &SigningKey) -> io::Result<()> {
     println!("I2P destination: {destination}");
     println!("Forwarding I2P -> 127.0.0.1:9000");
 
-    start_server_on("127.0.0.1:9000", "I2P", signing_key)
+    start_server_on("127.0.0.1:9000", "I2P", signing_key, false)
 }
 
 fn encrypt_and_store_device_key(
@@ -2494,6 +2646,8 @@ fn main() -> io::Result<()> {
     println!("4 = I2P server");
     println!("5 = list contacts");
     println!("6 = show history");
+    println!("7 = read mailbox");
+    println!("8 = mailbox server");
 
     let mut input = String::new();
 
@@ -2532,6 +2686,14 @@ fn main() -> io::Result<()> {
 
         "6" => {
             show_history();
+        }
+
+        "7" => {
+            read_mailbox_menu(&signing_key);
+        }
+
+        "8" => {
+            start_mailbox_server(&signing_key)?;
         }
 
         _ => {
@@ -4049,6 +4211,79 @@ cc:dd
         assert!(mailbox_read(path).unwrap().is_empty());
 
         fs::remove_file(path).ok();
+    }
+    #[test]
+    fn mailbox_deposit_packet_round_trip() {
+        let _ = set_contacts_key(b"mailbox-test-password");
+
+        let session_id = generate_session_id();
+        let shared_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+        let bob_ratchet_public =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bob_secret));
+        let alice = Arc::new(Mutex::new(create_ratchet_alice(
+            &shared_secret,
+            *bob_ratchet_public.as_bytes(),
+        )));
+        let bob = Arc::new(Mutex::new(create_ratchet_bob(&shared_secret, bob_secret)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let alice_key = SigningKey::from_bytes(&[211u8; 32]);
+        let bob_key = SigningKey::from_bytes(&[212u8; 32]);
+        let envelope = seal_mailbox_message(
+            &alice_key,
+            &bob_key.verifying_key(),
+            b"queued while offline",
+        )
+        .unwrap();
+
+        send_ratchet_packet(
+            &mut client,
+            &alice,
+            &session_id,
+            MESSAGE_TYPE_MAILBOX_DEPOSIT,
+            &envelope,
+        )
+        .unwrap();
+        let (message_type, payload) = receive_ratchet_packet(
+            &mut server,
+            &bob,
+            &session_id,
+            &[MESSAGE_TYPE_MAILBOX_DEPOSIT],
+        )
+        .unwrap();
+        assert_eq!(message_type, MESSAGE_TYPE_MAILBOX_DEPOSIT);
+        assert_eq!(payload, envelope);
+
+        let path = "test_mailbox_deposit.bin";
+        let _ = fs::remove_file(path);
+        mailbox_append(path, &payload).unwrap();
+        let records = mailbox_read(path).unwrap();
+        let (sender, message) = open_mailbox_message(&bob_key, &records[0]).unwrap();
+        assert_eq!(sender, alice_key.verifying_key());
+        assert_eq!(message, b"queued while offline");
+        fs::remove_file(path).ok();
+
+        send_ratchet_packet(
+            &mut server,
+            &bob,
+            &session_id,
+            MESSAGE_TYPE_MAILBOX_ACK,
+            &[],
+        )
+        .unwrap();
+        let (message_type, _) = receive_ratchet_packet(
+            &mut client,
+            &alice,
+            &session_id,
+            &[MESSAGE_TYPE_MAILBOX_ACK],
+        )
+        .unwrap();
+        assert_eq!(message_type, MESSAGE_TYPE_MAILBOX_ACK);
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
