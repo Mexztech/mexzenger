@@ -715,6 +715,7 @@ fn opus_decode_frames(frames: &[Vec<u8>]) -> io::Result<Vec<i16>> {
     Ok(samples)
 }
 
+#[cfg(test)]
 fn synthesize_sine(samples: usize) -> Vec<i16> {
     (0..samples)
         .map(|index| {
