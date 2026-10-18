@@ -495,6 +495,144 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year + i64::from(month <= 2), month, day)
 }
 
+const MESSAGE_TYPE_FILE_META: u8 = 4;
+const MESSAGE_TYPE_FILE_CHUNK: u8 = 5;
+const FILE_FRAGMENT_SIZE: usize = PLAINTEXT_SIZE - 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMeta {
+    name: String,
+    total_size: u64,
+    chunk_count: u32,
+}
+
+fn plan_file_transfer(name: &str, total_size: u64) -> FileMeta {
+    let chunk_count = total_size.div_ceil(FILE_FRAGMENT_SIZE as u64) as u32;
+    FileMeta {
+        name: name.to_string(),
+        total_size,
+        chunk_count,
+    }
+}
+
+fn serialize_file_meta(meta: &FileMeta) -> io::Result<Vec<u8>> {
+    let name_bytes = meta.name.as_bytes();
+    if name_bytes.len() > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "File name too long",
+        ));
+    }
+    let mut out = Vec::with_capacity(2 + name_bytes.len() + 8 + 4);
+    out.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(&meta.total_size.to_be_bytes());
+    out.extend_from_slice(&meta.chunk_count.to_be_bytes());
+    Ok(out)
+}
+
+fn parse_file_meta(data: &[u8]) -> io::Result<FileMeta> {
+    if data.len() < 2 + 8 + 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid file meta",
+        ));
+    }
+    let name_length = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if data.len() != 2 + name_length + 8 + 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid file meta length",
+        ));
+    }
+    let name = String::from_utf8_lossy(&data[2..2 + name_length]).to_string();
+    let total_size = u64::from_be_bytes(
+        data[2 + name_length..2 + name_length + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let chunk_count = u32::from_be_bytes(
+        data[2 + name_length + 8..2 + name_length + 12]
+            .try_into()
+            .unwrap(),
+    );
+    Ok(FileMeta {
+        name,
+        total_size,
+        chunk_count,
+    })
+}
+
+fn make_file_chunk(index: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + data.len());
+    out.extend_from_slice(&index.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+fn parse_file_chunk(data: &[u8]) -> io::Result<(u32, &[u8])> {
+    if data.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid file chunk",
+        ));
+    }
+    let index = u32::from_be_bytes(data[..4].try_into().unwrap());
+    Ok((index, &data[4..]))
+}
+
+struct IncomingFile {
+    meta: FileMeta,
+    chunks: std::collections::BTreeMap<u32, Vec<u8>>,
+}
+
+impl IncomingFile {
+    fn new(meta: FileMeta) -> Self {
+        Self {
+            meta,
+            chunks: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn add_chunk(&mut self, index: u32, data: &[u8]) -> io::Result<bool> {
+        if index >= self.meta.chunk_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Chunk index out of range",
+            ));
+        }
+        self.chunks.entry(index).or_insert_with(|| data.to_vec());
+        Ok(self.is_complete())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.chunks.len() as u32 == self.meta.chunk_count
+    }
+
+    fn assemble(&self) -> io::Result<Vec<u8>> {
+        if !self.is_complete() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "File incomplete",
+            ));
+        }
+        let mut out = Vec::with_capacity(self.meta.total_size as usize);
+        for index in 0..self.meta.chunk_count {
+            let chunk = self
+                .chunks
+                .get(&index)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing chunk"))?;
+            out.extend_from_slice(chunk);
+        }
+        if out.len() as u64 != self.meta.total_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Assembled size mismatch",
+            ));
+        }
+        Ok(out)
+    }
+}
 fn show_history() {
     match history_read(HISTORY_FILE) {
         Ok(entries) if entries.is_empty() => println!("No history"),
@@ -3146,6 +3284,60 @@ cc:dd
         assert_eq!(format_unix_time(0), "1970-01-01 00:00:00");
         assert_eq!(format_unix_time(86400), "1970-01-02 00:00:00");
         assert_eq!(format_unix_time(1767225600), "2026-01-01 00:00:00");
+    }
+    #[test]
+    fn file_meta_round_trip() {
+        let meta = plan_file_transfer("photo.png", 10_000);
+        assert!(meta.chunk_count >= 3);
+
+        let encoded = serialize_file_meta(&meta).unwrap();
+        let decoded = parse_file_meta(&encoded).unwrap();
+        assert_eq!(decoded, meta);
+
+        assert!(parse_file_meta(&encoded[..encoded.len() - 1]).is_err());
+        assert!(parse_file_meta(&[0, 5, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn file_chunks_reassemble_out_of_order() {
+        let data: Vec<u8> = (0u32..10_000).map(|n| (n % 251) as u8).collect();
+        let meta = plan_file_transfer("data.bin", data.len() as u64);
+        let mut incoming = IncomingFile::new(meta.clone());
+
+        let mut offsets: Vec<usize> = (0..meta.chunk_count as usize)
+            .map(|index| index * FILE_FRAGMENT_SIZE)
+            .collect();
+        offsets.reverse();
+
+        for index in offsets {
+            let end = (index + FILE_FRAGMENT_SIZE).min(data.len());
+            let chunk = make_file_chunk((index / FILE_FRAGMENT_SIZE) as u32, &data[index..end]);
+            let (chunk_index, chunk_data) = parse_file_chunk(&chunk).unwrap();
+            let complete = incoming.add_chunk(chunk_index, chunk_data).unwrap();
+            if chunk_index != 0 {
+                assert!(!complete);
+            }
+        }
+
+        assert!(incoming.is_complete());
+        assert_eq!(incoming.assemble().unwrap(), data);
+
+        let mut duplicate_test = IncomingFile::new(plan_file_transfer("x", 4));
+        duplicate_test.add_chunk(0, b"wxyz").unwrap();
+        assert!(duplicate_test.add_chunk(0, b"ABCD").unwrap());
+        assert_eq!(duplicate_test.assemble().unwrap(), b"wxyz");
+
+        assert!(duplicate_test.add_chunk(1, b"more").is_err());
+    }
+
+    #[test]
+    fn file_fragment_size_is_correct() {
+        assert_eq!(FILE_FRAGMENT_SIZE, PLAINTEXT_SIZE - 4);
+        assert_eq!(FILE_FRAGMENT_SIZE, 4018);
+
+        let empty = plan_file_transfer("empty", 0);
+        assert_eq!(empty.chunk_count, 0);
+        assert!(IncomingFile::new(empty).is_complete());
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
