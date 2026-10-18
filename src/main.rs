@@ -633,6 +633,97 @@ impl IncomingFile {
         Ok(out)
     }
 }
+const VNOTE_MAGIC: &[u8; 4] = b"PMVN";
+const VNOTE_SAMPLE_RATE: usize = 48000;
+const VNOTE_FRAME_SAMPLES: usize = 960;
+
+fn build_vnote_file(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(VNOTE_MAGIC);
+    out.extend_from_slice(&(frames.len() as u32).to_be_bytes());
+    for frame in frames {
+        out.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+        out.extend_from_slice(frame);
+    }
+    out
+}
+
+fn parse_vnote_file(data: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    if data.len() < 8 || !data.starts_with(VNOTE_MAGIC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid voice note file",
+        ));
+    }
+    let count = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+    let mut frames = Vec::with_capacity(count);
+    let mut position = 8;
+    for _ in 0..count {
+        if position + 2 > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated voice note file",
+            ));
+        }
+        let length = u16::from_be_bytes([data[position], data[position + 1]]) as usize;
+        position += 2;
+        if position + length > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Truncated voice note frame",
+            ));
+        }
+        frames.push(data[position..position + length].to_vec());
+        position += length;
+    }
+    Ok(frames)
+}
+
+fn opus_encode_samples(samples: &[i16]) -> io::Result<Vec<Vec<u8>>> {
+    use audiopus::{Application, Channels, SampleRate, coder::Encoder};
+    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
+        .map_err(|e| io::Error::other(format!("Opus encoder: {e}")))?;
+    let mut frames = Vec::new();
+    let mut position = 0;
+    while position < samples.len() {
+        let end = (position + VNOTE_FRAME_SAMPLES).min(samples.len());
+        let mut frame = vec![0i16; VNOTE_FRAME_SAMPLES];
+        frame[..end - position].copy_from_slice(&samples[position..end]);
+        let mut encoded = vec![0u8; 1500];
+        let length = encoder
+            .encode(&frame, &mut encoded)
+            .map_err(|e| io::Error::other(format!("Opus encode: {e}")))?;
+        encoded.truncate(length);
+        frames.push(encoded);
+        position = end;
+    }
+    Ok(frames)
+}
+
+fn opus_decode_frames(frames: &[Vec<u8>]) -> io::Result<Vec<i16>> {
+    use audiopus::{Channels, SampleRate, coder::Decoder};
+    let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)
+        .map_err(|e| io::Error::other(format!("Opus decoder: {e}")))?;
+    let mut samples = Vec::with_capacity(frames.len() * VNOTE_FRAME_SAMPLES);
+    for frame in frames {
+        let mut decoded = [0i16; VNOTE_FRAME_SAMPLES];
+        let length = decoder
+            .decode(Some(frame), &mut decoded[..], false)
+            .map_err(|e| io::Error::other(format!("Opus decode: {e}")))?;
+        samples.extend_from_slice(&decoded[..length]);
+    }
+    Ok(samples)
+}
+
+fn synthesize_sine(samples: usize) -> Vec<i16> {
+    (0..samples)
+        .map(|index| {
+            let phase =
+                2.0 * std::f32::consts::PI * 440.0 * index as f32 / VNOTE_SAMPLE_RATE as f32;
+            (phase.sin() * 0.3 * i16::MAX as f32) as i16
+        })
+        .collect()
+}
 fn show_history() {
     match history_read(HISTORY_FILE) {
         Ok(entries) if entries.is_empty() => println!("No history"),
@@ -3469,6 +3560,54 @@ cc:dd
         let empty = plan_file_transfer("empty", 0);
         assert_eq!(empty.chunk_count, 0);
         assert!(IncomingFile::new(empty).is_complete());
+    }
+    #[test]
+    fn voice_note_container_round_trip() {
+        let frames: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![], vec![9; 300]];
+        let encoded = build_vnote_file(&frames);
+        let decoded = parse_vnote_file(&encoded).unwrap();
+        assert_eq!(decoded, frames);
+        assert!(parse_vnote_file(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    fn best_lag_correlation(source: &[i16], decoded: &[i16], max_lag: usize) -> f64 {
+        let mut best = 0.0f64;
+        let n = source.len() as isize;
+        for lag in -(max_lag as isize)..=max_lag as isize {
+            let mut dot = 0.0;
+            let mut src_e = 0.0;
+            let mut dec_e = 0.0;
+            let mut count = 0usize;
+            for i in 0..n {
+                let j = i + lag;
+                if j < 0 || j >= n {
+                    continue;
+                }
+                let a = f64::from(source[i as usize]);
+                let b = f64::from(decoded[j as usize]);
+                dot += a * b;
+                src_e += a * a;
+                dec_e += b * b;
+                count += 1;
+            }
+            if count > (n as usize) / 2 {
+                let correlation = dot / (src_e.sqrt() * dec_e.sqrt());
+                best = best.max(correlation.abs());
+            }
+        }
+        best
+    }
+    #[test]
+    fn opus_round_trip_preserves_signal() {
+        let samples = synthesize_sine(VNOTE_SAMPLE_RATE / 10);
+        let frames = opus_encode_samples(&samples).unwrap();
+        assert_eq!(frames.len(), 5);
+
+        let decoded = opus_decode_frames(&frames).unwrap();
+        assert_eq!(decoded.len(), samples.len());
+
+        let best = best_lag_correlation(&samples, &decoded, 1200);
+        assert!(best > 0.9, "best lag correlation {best} too low");
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
