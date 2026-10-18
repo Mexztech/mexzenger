@@ -503,6 +503,13 @@ const MESSAGE_TYPE_MAILBOX_META: u8 = 8;
 const MESSAGE_TYPE_MAILBOX_CHUNK: u8 = 9;
 const MAILBOX_FRAGMENT_SIZE: usize = MAX_MESSAGE_SIZE - 4;
 const MAILBOX_FILE_MAGIC: &[u8; 4] = b"PMFW";
+const MAX_MAILBOX_DEPOSIT_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_MAILBOX_CHUNKS: u32 = 8192;
+const MAX_MAILBOX_LABEL_LEN: usize = 256;
+const MAX_MAILBOX_RECORD_BYTES: usize =
+    MAX_MAILBOX_DEPOSIT_BYTES as usize + MAILBOX_ENVELOPE_OVERHEAD + 256;
+const MAX_MAILBOX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MAILBOX_RECORDS: usize = 256;
 const FILE_FRAGMENT_SIZE: usize = MAX_MESSAGE_SIZE - 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -837,6 +844,23 @@ fn open_mailbox_message(
 }
 
 fn mailbox_append(path: &str, envelope: &[u8]) -> io::Result<()> {
+    if envelope.len() > MAX_MAILBOX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Mailbox record exceeds maximum size",
+        ));
+    }
+    let current_len = if Path::new(path).exists() {
+        fs::metadata(path)?.len()
+    } else {
+        0
+    };
+    if current_len + envelope.len() as u64 + 4 > MAX_MAILBOX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "Mailbox quota exceeded",
+        ));
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -849,10 +873,23 @@ fn mailbox_read(path: &str) -> io::Result<Vec<Vec<u8>>> {
     if !Path::new(path).exists() {
         return Ok(Vec::new());
     }
+    let file_len = fs::metadata(path)?.len();
+    if file_len > MAX_MAILBOX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Mailbox file exceeds maximum size",
+        ));
+    }
     let data = fs::read(path)?;
     let mut records = Vec::new();
     let mut position = 0;
     while position < data.len() {
+        if records.len() >= MAX_MAILBOX_RECORDS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Too many mailbox records",
+            ));
+        }
         if position + 4 > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -861,10 +898,10 @@ fn mailbox_read(path: &str) -> io::Result<Vec<Vec<u8>>> {
         }
         let length = u32::from_be_bytes(data[position..position + 4].try_into().unwrap()) as usize;
         position += 4;
-        if position + length > data.len() {
+        if length > MAX_MAILBOX_RECORD_BYTES || position + length > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Truncated mailbox record",
+                "Invalid mailbox record length",
             ));
         }
         records.push(data[position..position + length].to_vec());
@@ -1399,6 +1436,12 @@ impl MailboxDeposit {
     }
 
     fn add_chunk(&mut self, index: u32, data: &[u8]) -> io::Result<bool> {
+        if data.len() > MAILBOX_FRAGMENT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Chunk exceeds maximum size",
+            ));
+        }
         if index >= self.chunk_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1469,6 +1512,22 @@ fn parse_mailbox_meta(data: &[u8]) -> io::Result<(u64, u32, String)> {
             io::ErrorKind::InvalidData,
             "Invalid mailbox meta length",
         ));
+    }
+    if total_len == 0 || total_len > MAX_MAILBOX_DEPOSIT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Deposit size limit exceeded",
+        ));
+    }
+    let expected_chunks = total_len.div_ceil(MAILBOX_FRAGMENT_SIZE as u64) as u32;
+    if chunk_count == 0 || chunk_count != expected_chunks || chunk_count > MAX_MAILBOX_CHUNKS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid chunk count",
+        ));
+    }
+    if label_len > MAX_MAILBOX_LABEL_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Label too long"));
     }
     let label = String::from_utf8_lossy(&data[14..14 + label_len]).to_string();
     Ok((total_len, chunk_count, label))
@@ -1603,7 +1662,11 @@ fn mailbox_session<T: Transport + ?Sized>(
                         "Mailbox: receiving deposit {} ({} bytes, {} chunks)",
                         label, total_len, chunk_count
                     );
-                    pending = Some(MailboxDeposit::new(total_len, chunk_count, label));
+                    if pending.is_some() {
+                        println!("Mailbox: refusing new deposit: one already in progress");
+                    } else {
+                        pending = Some(MailboxDeposit::new(total_len, chunk_count, label));
+                    }
                 }
                 Err(error) => println!("Invalid mailbox meta: {}", error),
             },
@@ -1667,15 +1730,21 @@ fn read_mailbox_menu(signing_key: &SigningKey) {
         Ok(records) => {
             let total = records.len();
             let mut opened = 0usize;
-            for record in &records {
+            for (record_index, record) in records.iter().enumerate() {
                 match open_mailbox_message(signing_key, record) {
                     Ok((sender, message)) => {
                         if message.starts_with(MAILBOX_FILE_MAGIC) {
                             match unwrap_mailbox_file(&message) {
                                 Ok((label, file_data)) => {
-                                    let safe_label =
-                                        label.rsplit('/').next().unwrap_or("file").to_string();
-                                    let out_path = format!("received_mail_{}", safe_label);
+                                    let safe_label: String = label
+                                        .chars()
+                                        .filter(|character| {
+                                            character.is_alphanumeric()
+                                                || matches!(*character, '.' | '-' | '_')
+                                        })
+                                        .collect();
+                                    let out_path =
+                                        format!("received_mail_{}_{}", record_index, safe_label);
                                     match fs::write(&out_path, &file_data) {
                                         Ok(()) => {
                                             opened += 1;
@@ -4762,6 +4831,34 @@ cc:dd
         let (label, data) = unwrap_mailbox_file(&opened).unwrap();
         assert_eq!(label, "big.bin");
         assert_eq!(data, vec![0xABu8; 50_000]);
+    }
+    #[test]
+    fn mailbox_limits_are_enforced() {
+        let oversized = make_mailbox_meta(MAX_MAILBOX_DEPOSIT_BYTES + 1, 1, "x.pmv").unwrap();
+        assert!(parse_mailbox_meta(&oversized).is_err());
+
+        let count_mismatch = make_mailbox_meta(100, 5, "x.pmv").unwrap();
+        assert!(parse_mailbox_meta(&count_mismatch).is_err());
+
+        let long_label = "x".repeat(MAX_MAILBOX_LABEL_LEN + 1);
+        let bad_label = make_mailbox_meta(100, 1, &long_label).unwrap();
+        assert!(parse_mailbox_meta(&bad_label).is_err());
+
+        let good = make_mailbox_meta(100, 1, "ok.pmv").unwrap();
+        assert!(parse_mailbox_meta(&good).is_ok());
+
+        let mut deposit = MailboxDeposit::new(MAILBOX_FRAGMENT_SIZE as u64, 1, "x".to_string());
+        let too_big = vec![0u8; MAILBOX_FRAGMENT_SIZE + 1];
+        assert!(deposit.add_chunk(0, &too_big).is_err());
+
+        let path = "test_mailbox_limits.bin";
+        let _ = fs::remove_file(path);
+        let mut data = Vec::new();
+        data.extend_from_slice(&((MAX_MAILBOX_RECORD_BYTES as u32) + 1).to_be_bytes());
+        data.extend_from_slice(&[0u8; 64]);
+        fs::write(path, &data).unwrap();
+        assert!(mailbox_read(path).is_err());
+        fs::remove_file(path).ok();
     }
     #[test]
     fn old_handshake_signature_cannot_verify_on_reconnect() {
